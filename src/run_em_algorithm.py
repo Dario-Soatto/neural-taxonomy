@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 from tqdm import tqdm
 
+from em_scores import compute_document_level_scores, compute_corpus_level_scores
+
 # --- EM Refinement Constants ---
 # For decide_schema_updates
 SIMILARITY_THRESHOLD_MERGE = 0.9  # Cosine similarity for merging cluster centroids
@@ -505,7 +507,36 @@ def em_schema_refinement(
     if sample_size_for_baseline > 0:
         texts_for_baseline_sample = current_merged_df[text_column_name].sample(sample_size_for_baseline).tolist()
         baseline_log_px = current_prob_calibrator.compute_average_log_px_from_sample(texts_for_baseline_sample)
-        logging.info(f"  Baseline log p(x) = {baseline_log_px:.4f} (based on {sample_size_for_baseline} samples)")
+        
+        logging.info(f"Baseline log p(x) = {baseline_log_px:.4f} (based on {sample_size_for_baseline} samples)")
+
+        # NEW: E-step scoring
+        doc_scores = compute_document_level_scores(
+            df=current_merged_df,
+            text_col=text_column_name,
+            cluster_col="agglomerative_label",
+            choices=current_choices_list,
+            prob_calibrator=current_prob_calibrator,
+            embeddings=all_embeddings if 'all_embeddings' in locals() else None,
+            p_z_prior=getattr(current_prob_calibrator, "p_z", None),  # uses dataset prior if available
+        )
+        # Persist per-row pmax / assignments for analysis
+        current_merged_df["pmax_explained"] = doc_scores["row_pmax"]     
+        current_merged_df["z_hat_explainer"] = doc_scores["row_z_hat"]   
+
+        # Optionally compute corpus scores (treat all as test or pass a mask)
+        corpus_scores = compute_corpus_level_scores(
+            log_px_given_z_hat=doc_scores["row_log_px_given_z_norm"][np.arange(len(current_merged_df)),
+                                                                    current_merged_df["z_hat_explainer"].values],
+            token_counts=None,             # plug true token counts if you track them
+            k_complexity=len(current_choices_list),  # simple complexity proxy
+            is_test_mask=None,
+        )  
+
+        logging.info(f"[E-step] L_baseline={doc_scores['L_baseline']:.4f}, "
+                    f"logL_total={corpus_scores['logL_cond_total']:.2f}, "
+                    f"AIC={corpus_scores['AIC']}, BIC={corpus_scores['BIC']}, "
+                    f"PPL={corpus_scores['perplexity']:.3f}")  
     else:
         logging.warning("  Dataset is empty or too small for baseline sample, cannot compute baseline log p(x). Using {baseline_log_px}.")
 
