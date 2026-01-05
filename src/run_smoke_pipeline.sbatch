@@ -3,7 +3,7 @@
 #SBATCH --partition=john
 #SBATCH --account=nlp
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
+#SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --output=/nlp/scr/tdalmia/projects/neural-taxonomy/logs/nt_smoke_%j.out
 #SBATCH --error=/nlp/scr/tdalmia/projects/neural-taxonomy/logs/nt_smoke_%j.err
@@ -28,7 +28,7 @@ MODEL_NAME="gpt-4o-mini"
 
 mkdir -p "${EXP_DIR}" "${EXP_DIR}/data" "${EXP_DIR}/models" logs
 
-INPUT_FILE="${EXP_DIR}/editorial-discourse-input-data.csv"
+INPUT_FILE="${EXP_DIR}/editorial-discourse-input-data.small.csv"
 STEP1_OUT="${EXP_DIR}/custom-initial-labeling.json"
 
 ln -sf /nlp/scr/tdalmia/projects/neural-taxonomy/processed_custom_input.csv "${INPUT_FILE}"
@@ -43,9 +43,9 @@ python src/step_1__run_initial_labeling_prompts.py \
   --output_file "${STEP1_OUT}" \
   --experiment "${EXP_NAME}" \
   --start_idx 0 \
-  --end_idx 10 \
-  --batch_size 10 \
-  --num_sents_per_prompt 2 \
+  --end_idx 4 \
+  --batch_size 1 \
+  --num_sents_per_prompt 1 \
   --use_openai
 
 STEP1_LABELS="${EXP_DIR}/custom-initial-labeling-labeling__experiment-${EXP_NAME}__model_${MODEL_NAME//\//-}__0_10.json"
