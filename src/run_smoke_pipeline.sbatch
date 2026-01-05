@@ -30,6 +30,9 @@ mkdir -p "${EXP_DIR}" "${EXP_DIR}/data" "${EXP_DIR}/models" logs
 
 INPUT_FILE="${EXP_DIR}/editorial-discourse-input-data.csv"
 STEP1_OUT="${EXP_DIR}/custom-initial-labeling.json"
+
+ln -sf /nlp/scr/tdalmia/projects/neural-taxonomy/processed_custom_input.csv "${INPUT_FILE}"
+
 SIM_OUT="${EXP_DIR}/${MODEL_NAME//\//-}-similarity-data.jsonl"
 SBERT_MODEL="sentence-transformers/all-MiniLM-L6-v2"
 SBERT_OUT="${EXP_DIR}/models/custom-sentence-similarity-model"
