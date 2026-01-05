@@ -22,7 +22,7 @@ export TOKENIZERS_PARALLELISM=false
 
 : "${OPENAI_API_KEY:?OPENAI_API_KEY is not set}"
 
-EXP_NAME=editorial
+EXP_NAME=editorials
 EXP_DIR=experiments/${EXP_NAME}
 MODEL_NAME="gpt-4o-mini"
 
