@@ -57,7 +57,7 @@ def get_linkage_matrix_from_model(model, n_samples):
                 child_cluster_sizes[j] = 1
             else:
                 # If the child is a cluster, get its size from the counts array
-                child_cluster_sizes[j] = counts[child - n_samples] + 1
+                child_cluster_sizes[j] = counts[child - n_samples]
                 
         # Record the size of the merged cluster
         counts[i] = child_cluster_sizes.sum()

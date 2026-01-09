@@ -136,7 +136,7 @@ def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_p
             
             for i in range(0, len(sents), num_sents_per_prompt):
                 sents_chunk = sents[i: i + num_sents_per_prompt]
-                sents_chunk = list(map(lambda x: f"(idx {i + x[0]}) {x[1].replace('\n', ' ').strip()}", enumerate(sents_chunk)))
+                sents_chunk = list(map(lambda x: f"(idx {i + x[0]}) {x[1].replace(chr(10), ' ').strip()}", enumerate(sents_chunk)))
                 sents_chunk_text = '\n'.join(sents_chunk)
                 
                 all_responses.append({
