@@ -12,7 +12,10 @@ import re
 
 from vllm import LLM,  SamplingParams
 from transformers import AutoTokenizer
-from vllm.sampling_params import GuidedDecodingParams
+try:
+    from vllm.sampling_params import GuidedDecodingParams
+except ImportError:
+    GuidedDecodingParams = None
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
@@ -71,7 +74,7 @@ def run_vllm_batch(
     try:
         if sampling_params is None:
             sampling_params = SamplingParams(temperature=0.1, max_tokens=4096)
-        if response_format is not None:
+        if response_format is not None and GuidedDecodingParams is not None:
             guided_decoding_params = GuidedDecodingParams(json=response_format.model_json_schema())
             sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
 
