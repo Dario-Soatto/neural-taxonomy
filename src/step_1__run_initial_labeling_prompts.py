@@ -54,10 +54,13 @@ from prompts import (
 # Import VLLM only if needed
 def load_vllm_dependencies():
     from vllm import LLM, SamplingParams
-    from vllm.sampling_params import GuidedDecodingParams
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+    except ImportError:
+        GuidedDecodingParams = None
     from transformers import AutoTokenizer
     from utils_vllm_client import load_model as load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity
-    return LLM, SamplingParams, AutoTokenizer, load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity
+    return LLM, SamplingParams, AutoTokenizer, load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity, GuidedDecodingParams
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(lineno)d - %(message)s",
@@ -268,12 +271,15 @@ def make_labeling_prompts_hate_speech(input_df, multi_sentence=False, num_sents_
         return prompt_df
 
 
-def process_batch_vllm(model, prompts_to_run, response_format):
+def process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=None):
     """Process a batch of prompts using VLLM."""
     logging.info(f'sample prompt: {prompts_to_run["prompt"].tolist()[0]}')
     json_schema = response_format.model_json_schema()
-    guided_decoding_params = GuidedDecodingParams(response_format=json_schema)
-    sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
+    if guided_decoding_cls is not None:
+        guided_decoding_params = guided_decoding_cls(response_format=json_schema)
+        sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
+    else:
+        sampling_params = SamplingParams(temperature=0.1, max_tokens=1024)
 
     outputs = model.generate(prompts_to_run['prompt'].tolist(), sampling_params)
     inputted_prompts = list(map(lambda x: x.prompt, outputs))
@@ -400,7 +406,7 @@ if __name__ == "__main__":
 
     # load the model and dependencies based on the backend
     if not args.use_openai:
-        LLM, SamplingParams, AutoTokenizer, load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity = load_vllm_dependencies()
+        LLM, SamplingParams, AutoTokenizer, load_vllm_model, write_to_file, robust_parse_outputs, check_output_validity, GuidedDecodingParams = load_vllm_dependencies()
         tokenizer, model = load_vllm_model(args.model)
         logging.info(f'loaded VLLM model {args.model}')
 
@@ -466,7 +472,7 @@ if __name__ == "__main__":
             # create an empty file to indicate that this batch is being processed
             with open(output_fname, 'w') as f:
                 f.write('')
-            inputted_prompts, model_outputs, outputs = process_batch_vllm(model, prompts_to_run, response_format)
+            inputted_prompts, model_outputs, outputs = process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=GuidedDecodingParams)
             if save_outputs(output_fname, inputted_prompts, model_outputs, prompts_to_run, use_openai=False, outputs=outputs):
                 logging.info(f'-----------\nsample output: {model_outputs[0]}\n-----------\n')
 
