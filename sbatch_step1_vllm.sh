@@ -19,8 +19,7 @@ OUTPUT_FILE="experiments/wiki_biographies/wiki_biographies-initial-labeling.json
 cd "${REPO_DIR}"
 mkdir -p logs
 
-source ~/.bashrc
-conda init
+source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
 
 python src/step_1__run_initial_labeling_prompts.py \
