@@ -12,12 +12,19 @@
 set -euo pipefail
 
 REPO_DIR="/nlp/scr/tdalmia/projects/neural-taxonomy"
-MODEL_NAME="Qwen/Qwen2.5-3B-Instruct"
+MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct"
 INPUT_FILE="experiments/wiki_biographies/data/processed_custom_input_subset.csv"
 OUTPUT_FILE="experiments/wiki_biographies/wiki_biographies-initial-labeling.json"
 
 cd "${REPO_DIR}"
 mkdir -p logs
+
+# Avoid /sailhome quota by putting HF caches on scratch
+export HF_HOME=/nlp/scr/tdalmia/hf_cache
+export HUGGINGFACE_HUB_CACHE=/nlp/scr/tdalmia/hf_cache/hub
+export TRANSFORMERS_CACHE=/nlp/scr/tdalmia/hf_cache/transformers
+export HF_DATASETS_CACHE=/nlp/scr/tdalmia/hf_cache/datasets
+mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
 
 source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
