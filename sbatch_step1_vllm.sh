@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=step1_vllm_wiki
+#SBATCH --account=nlp
 #SBATCH --partition=jag-lo
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
