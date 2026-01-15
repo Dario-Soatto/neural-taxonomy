@@ -20,6 +20,7 @@ cd "${REPO_DIR}"
 mkdir -p logs
 
 source ~/.bashrc
+conda init
 conda activate nlp
 
 python src/step_1__run_initial_labeling_prompts.py \
