@@ -67,8 +67,15 @@ def compute_document_level_scores(
     K = len(choices)
     L_z = np.zeros(K)
     C_z = np.zeros(K)
+    choice_to_idx = {str(c): i for i, c in enumerate(choices)}
+    assigned_idx = (
+        df[cluster_col]
+        .astype(str)
+        .map(lambda x: choice_to_idx.get(x, -1))
+        .to_numpy()
+    )
     for j in range(K):
-        mask = (z_hat == j)
+        mask = (assigned_idx == j)
         L_z[j] = log_PX_given_Z_norm[mask, j].mean() if mask.any() else float('-inf')
         C_z[j] = PZX[:, j].mean()
 
@@ -103,8 +110,10 @@ def compute_document_level_scores(
         "row_pmax": pmax,
         "row_z_hat": z_hat,
         "row_log_px_given_z_norm": log_PX_given_Z_norm,
+        "row_px_given_z_norm": PX_given_Z_norm,
         "PZX": PZX,
         "pz_prior": pz,
+        "row_cluster_idx": assigned_idx,
     }
 
 def compute_corpus_level_scores(
@@ -112,6 +121,9 @@ def compute_corpus_level_scores(
     token_counts: np.ndarray | None = None,
     k_complexity: int | None = None,
     is_test_mask: np.ndarray | None = None,
+    q_ij: np.ndarray | None = None,
+    log_px_given_z: np.ndarray | None = None,
+    log_pz: np.ndarray | None = None,
 ) -> Dict:
     """
     Inputs:
@@ -138,10 +150,20 @@ def compute_corpus_level_scores(
     T = float(np.sum(token_counts))
     ppl = float(np.exp(- np.sum(log_px_given_z_hat) / max(T, 1.0)))
 
+    elbo = None
+    if q_ij is not None and log_px_given_z is not None and log_pz is not None:
+        q_ij = np.asarray(q_ij, dtype=float)
+        log_px_given_z = np.asarray(log_px_given_z, dtype=float)
+        log_pz = np.asarray(log_pz, dtype=float)
+        if q_ij.ndim != 2 or log_px_given_z.shape != q_ij.shape or log_pz.ndim != 1:
+            raise ValueError("ELBO inputs must have shapes: q_ij (N,K), log_px_given_z (N,K), log_pz (K,).")
+        log_q = _safe_log(q_ij)
+        elbo = float(np.sum(q_ij * (log_px_given_z + log_pz[None, :] - log_q)))
+
     return {
         "logL_cond_total": logL,
         "AIC": aic,
         "BIC": bic,
         "perplexity": ppl,
-        "ELBO": None,
+        "ELBO": elbo,
     }

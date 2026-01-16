@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 from tqdm import tqdm
 
-from em_scores import compute_document_level_scores, compute_corpus_level_scores
+from em_scores import compute_document_level_scores, compute_corpus_level_scores, bayes_px_given_z_normalized
 
 # --- EM Refinement Constants ---
 # For decide_schema_updates
@@ -107,6 +107,21 @@ def determine_target_clustering_info(agglomerative_output_dir: Path, agglomerati
     logging.info(f"Targeting agglomerative clustering: Level {target_level}, N_Clusters {target_n_clusters}")
     logging.info(f"Using cluster assignment file: {selected_level_assignments_path}")
     return target_level, target_n_clusters, selected_level_assignments_path
+
+
+def resolve_agglomerative_output_dir(experiment_base_dir: Path) -> Path:
+    default_dir = experiment_base_dir / "hierarchy_results"
+    if default_dir.exists():
+        return default_dir
+    standard_dir = experiment_base_dir / "hierarchy_results__standard"
+    if standard_dir.exists():
+        logging.warning(f"Using agglomerative output dir: {standard_dir} (default hierarchy_results not found).")
+        return standard_dir
+    candidates = sorted(experiment_base_dir.glob("hierarchy_results__*"))
+    if candidates:
+        logging.warning(f"Using agglomerative output dir: {candidates[0]} (default hierarchy_results not found).")
+        return candidates[0]
+    return default_dir
 
 
 def load_and_prepare_data(sentence_data_path: Path, selected_level_assignments_path: Path, agglomerative_labels_path: Path) -> tuple[pd.DataFrame, list[str]]:
@@ -231,12 +246,21 @@ def compute_cluster_metrics(
         baseline_log_px: float, 
         verbose: bool = False,
         text_column: str = 'sentence_text',
-        max_texts_per_cluster_metrics: int = DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS
+        max_texts_per_cluster_metrics: int = DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS,
+        p_z_prior: np.ndarray | None = None
     ) -> dict:
     """Compute per-cluster metrics: average log-likelihood, posterior confidence, variance."""
     logging.info("Starting computation of cluster metrics...")
     cluster_metrics = {}
     choice_to_idx = {c: i for i, c in enumerate(choices_list)}
+    if p_z_prior is None:
+        labels_as_str = merged_df['agglomerative_label'].astype(str)
+        choices_str = [str(c) for c in choices_list]
+        counts = pd.Categorical(labels_as_str, categories=choices_str).value_counts()
+        p_z_prior = counts.to_numpy(dtype=float)
+        p_z_prior = p_z_prior / p_z_prior.sum() if p_z_prior.sum() > 0 else np.ones(len(choices_str)) / len(choices_str)
+    else:
+        p_z_prior = np.array(p_z_prior, dtype=float)
 
     # Determine the iterator for clusters, potentially with tqdm
     cluster_groups = merged_df.groupby('cluster_id')
@@ -306,9 +330,10 @@ def compute_cluster_metrics(
                 text_iterator = tqdm(texts_for_metrics, desc=f"Scoring texts in cluster {cluster_id} ('{label[:20]}...')", unit="text", leave=False, total=len(texts_for_metrics))
             
             for txt in text_iterator:
-                log_p_z_given_x = prob_calibrator.compute_log_p_z_given_X(txt)
-                log_likelihoods.append(float(log_p_z_given_x[label_idx]))
-                posterior_probs.append(float(torch.exp(log_p_z_given_x[label_idx])))
+                p_z_given_x = prob_calibrator.calibrate_p_z_given_X(txt)
+                p_x_given_z = bayes_px_given_z_normalized(np.array(p_z_given_x, dtype=float), p_z_prior)
+                log_likelihoods.append(float(np.log(max(p_x_given_z[label_idx], 1e-30))))
+                posterior_probs.append(float(p_z_given_x[label_idx]))
             L_z = np.mean(log_likelihoods) if log_likelihoods else float('-inf')
             C_z = np.mean(posterior_probs) if posterior_probs else 0.0
 
@@ -531,12 +556,16 @@ def em_schema_refinement(
             token_counts=None,             # plug true token counts if you track them
             k_complexity=len(current_choices_list),  # simple complexity proxy
             is_test_mask=None,
+            q_ij=doc_scores["PZX"],
+            log_px_given_z=doc_scores["row_log_px_given_z_norm"],
+            log_pz=np.log(np.clip(doc_scores["pz_prior"], 1e-30, None)),
         )  
 
         logging.info(f"[E-step] L_baseline={doc_scores['L_baseline']:.4f}, "
                     f"logL_total={corpus_scores['logL_cond_total']:.2f}, "
                     f"AIC={corpus_scores['AIC']}, BIC={corpus_scores['BIC']}, "
-                    f"PPL={corpus_scores['perplexity']:.3f}")  
+                    f"PPL={corpus_scores['perplexity']:.3f}, "
+                    f"ELBO={corpus_scores['ELBO']}")  
     else:
         logging.warning("  Dataset is empty or too small for baseline sample, cannot compute baseline log p(x). Using {baseline_log_px}.")
 
@@ -556,7 +585,8 @@ def em_schema_refinement(
             baseline_log_px,
             verbose=verbose,
             text_column=text_column_name,
-            max_texts_per_cluster_metrics=max_texts_per_cluster_metrics
+            max_texts_per_cluster_metrics=max_texts_per_cluster_metrics,
+            p_z_prior=doc_scores["pz_prior"] if 'doc_scores' in locals() else None
         )
         actions = decide_schema_updates(cluster_metrics)
         iteration_actions.update(actions)
@@ -651,15 +681,18 @@ def em_schema_refinement(
             current_choices_list.append(label)
             temp_label_map[cid_val] = label
         current_merged_df['agglomerative_label'] = current_merged_df['cluster_id'].map(temp_label_map)
-        logging.info(f"Iteration {iter_idx + 1}: Re-initializing ProbabilityCalibrator with {len(current_choices_list)} choices: {current_choices_list}")
-        current_prob_calibrator = initialize_probability_calibrator(
-            model_identifier=model_identifier,
-            model_type=model_type,
-            choices=current_choices_list,
-            num_trials=current_prob_calibrator.num_trials,
-            scorer_type=current_prob_calibrator.scorer_type,
-            verbose=verbose
-        )
+        if set(current_prob_calibrator.choices) != set(current_choices_list):
+            logging.info(f"Iteration {iter_idx + 1}: Re-initializing ProbabilityCalibrator with {len(current_choices_list)} choices: {current_choices_list}")
+            current_prob_calibrator = initialize_probability_calibrator(
+                model_identifier=model_identifier,
+                model_type=model_type,
+                choices=current_choices_list,
+                num_trials=current_prob_calibrator.num_trials,
+                scorer_type="batch" if current_prob_calibrator.batch_prompts is False else "single",
+                verbose=verbose
+            )
+        else:
+            logging.info(f"Iteration {iter_idx + 1}: Choices unchanged; reusing existing ProbabilityCalibrator.")
         logging.info(f"=== EM Iteration {iter_idx + 1} Complete. #Clusters: {len(unique_cluster_ids_after_iter)} ===")
 
         # Log P(z) for the current schema labels if verbose
@@ -691,7 +724,7 @@ def main(args):
     # 1. Construct paths
     experiment_base_dir = Path(args.experiment_dir)
     models_dir = experiment_base_dir / "models"
-    agglomerative_output_dir = experiment_base_dir / "hierarchy_results"
+    agglomerative_output_dir = resolve_agglomerative_output_dir(experiment_base_dir)
     sentence_data_path = models_dir / "all_extracted_discourse_with_clusters.csv" # Input for examples_df
     agglomerative_labels_path = agglomerative_output_dir / "inner_node_labels.csv" # Input for initial_labels
 
