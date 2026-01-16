@@ -45,7 +45,12 @@ export PIP_CACHE_DIR="$LOCAL_SCRATCH/cache/pip"
 
 # Disable vLLM usage stats to avoid writes to home cache
 export VLLM_USAGE_STATS=0
+export VLLM_DISABLE_USAGE_STATS=1
+export VLLM_NO_USAGE_STATS=1
 export VLLM_USAGE_STATS_PATH="$LOCAL_SCRATCH/cache/vllm/usage_stats.json"
+
+# If vLLM ignores the env flags, force its default path off /sailhome
+export HOME="$LOCAL_SCRATCH"
 
 source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
