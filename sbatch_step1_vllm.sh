@@ -26,6 +26,17 @@ export TRANSFORMERS_CACHE=/nlp/scr/tdalmia/hf_cache/transformers
 export HF_DATASETS_CACHE=/nlp/scr/tdalmia/hf_cache/datasets
 mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
 
+# Redirect flashinfer JIT cache off /sailhome
+export XDG_CACHE_HOME=/nlp/scr/tdalmia/.cache
+export FLASHINFER_WORKSPACE_DIR=/nlp/scr/tdalmia/.cache/flashinfer
+mkdir -p "$XDG_CACHE_HOME" "$FLASHINFER_WORKSPACE_DIR"
+
+# Redirect other common caches off /sailhome
+export TORCH_HOME=/nlp/scr/tdalmia/.cache/torch
+export TORCH_EXTENSIONS_DIR=/nlp/scr/tdalmia/.cache/torch_extensions
+export PIP_CACHE_DIR=/nlp/scr/tdalmia/.cache/pip
+mkdir -p "$TORCH_HOME" "$TORCH_EXTENSIONS_DIR" "$PIP_CACHE_DIR"
+
 source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
 
