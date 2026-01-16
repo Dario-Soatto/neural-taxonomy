@@ -474,8 +474,12 @@ if __name__ == "__main__":
             with open(output_fname, 'w') as f:
                 f.write('')
             inputted_prompts, model_outputs, outputs = process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=GuidedDecodingParams)
-            if save_outputs(output_fname, inputted_prompts, model_outputs, prompts_to_run, use_openai=False, outputs=outputs):
-                logging.info(f'-----------\nsample output: {model_outputs[0]}\n-----------\n')
+            write_to_file(
+                output_fname,
+                indices=prompts_to_run['index'].tolist(),
+                outputs=outputs
+            )
+            logging.info(f'-----------\nsample output: {model_outputs[0]}\n-----------\n')
 
 """
 python step_1__run_initial_labeling_prompts.py \
