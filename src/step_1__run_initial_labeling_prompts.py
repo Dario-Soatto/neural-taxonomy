@@ -457,6 +457,7 @@ if __name__ == "__main__":
         num_batches = (args.end_idx - args.start_idx) // args.batch_size
         batch_indices = [(i * args.batch_size, min((i + 1) * args.batch_size, args.end_idx)) for i in range(num_batches)]
         random.shuffle(batch_indices)
+        response_format = prompts['response_format'].iloc[0]
 
         logging.info(f'running prompts for {args.end_idx - args.start_idx} rows')
         for start_idx, end_idx in tqdm(batch_indices):

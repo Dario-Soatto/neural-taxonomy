@@ -37,6 +37,11 @@ export TORCH_EXTENSIONS_DIR=/nlp/scr/tdalmia/.cache/torch_extensions
 export PIP_CACHE_DIR=/nlp/scr/tdalmia/.cache/pip
 mkdir -p "$TORCH_HOME" "$TORCH_EXTENSIONS_DIR" "$PIP_CACHE_DIR"
 
+# Disable vLLM usage stats to avoid writes to home cache
+export VLLM_USAGE_STATS=0
+export VLLM_USAGE_STATS_PATH=/nlp/scr/tdalmia/.cache/vllm/usage_stats.json
+mkdir -p /nlp/scr/tdalmia/.cache/vllm
+
 source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
 
