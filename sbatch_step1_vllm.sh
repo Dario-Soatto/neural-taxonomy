@@ -19,28 +19,33 @@ OUTPUT_FILE="experiments/wiki_biographies/wiki_biographies-initial-labeling.json
 cd "${REPO_DIR}"
 mkdir -p logs
 
-# Avoid /sailhome quota by putting HF caches on scratch
-export HF_HOME=/nlp/scr/tdalmia/hf_cache
-export HUGGINGFACE_HUB_CACHE=/nlp/scr/tdalmia/hf_cache/hub
-export TRANSFORMERS_CACHE=/nlp/scr/tdalmia/hf_cache/transformers
-export HF_DATASETS_CACHE=/nlp/scr/tdalmia/hf_cache/datasets
-mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
+# Prefer node-local SSD if available to reduce load on shared filesystems
+if [ -d /scr-ssd ]; then
+  LOCAL_SCRATCH=/scr-ssd/tdalmia
+else
+  LOCAL_SCRATCH=/nlp/scr/tdalmia
+fi
+
+mkdir -p "$LOCAL_SCRATCH"/{hf_cache,cache,cache/flashinfer,cache/torch,cache/torch_extensions,cache/pip,cache/vllm}
+
+# Avoid /sailhome quota by putting caches on local scratch
+export HF_HOME="$LOCAL_SCRATCH/hf_cache"
+export HUGGINGFACE_HUB_CACHE="$LOCAL_SCRATCH/hf_cache/hub"
+export TRANSFORMERS_CACHE="$LOCAL_SCRATCH/hf_cache/transformers"
+export HF_DATASETS_CACHE="$LOCAL_SCRATCH/hf_cache/datasets"
 
 # Redirect flashinfer JIT cache off /sailhome
-export XDG_CACHE_HOME=/nlp/scr/tdalmia/.cache
-export FLASHINFER_WORKSPACE_DIR=/nlp/scr/tdalmia/.cache/flashinfer
-mkdir -p "$XDG_CACHE_HOME" "$FLASHINFER_WORKSPACE_DIR"
+export XDG_CACHE_HOME="$LOCAL_SCRATCH/cache"
+export FLASHINFER_WORKSPACE_DIR="$LOCAL_SCRATCH/cache/flashinfer"
 
 # Redirect other common caches off /sailhome
-export TORCH_HOME=/nlp/scr/tdalmia/.cache/torch
-export TORCH_EXTENSIONS_DIR=/nlp/scr/tdalmia/.cache/torch_extensions
-export PIP_CACHE_DIR=/nlp/scr/tdalmia/.cache/pip
-mkdir -p "$TORCH_HOME" "$TORCH_EXTENSIONS_DIR" "$PIP_CACHE_DIR"
+export TORCH_HOME="$LOCAL_SCRATCH/cache/torch"
+export TORCH_EXTENSIONS_DIR="$LOCAL_SCRATCH/cache/torch_extensions"
+export PIP_CACHE_DIR="$LOCAL_SCRATCH/cache/pip"
 
 # Disable vLLM usage stats to avoid writes to home cache
 export VLLM_USAGE_STATS=0
-export VLLM_USAGE_STATS_PATH=/nlp/scr/tdalmia/.cache/vllm/usage_stats.json
-mkdir -p /nlp/scr/tdalmia/.cache/vllm
+export VLLM_USAGE_STATS_PATH="$LOCAL_SCRATCH/cache/vllm/usage_stats.json"
 
 source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
