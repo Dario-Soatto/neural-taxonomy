@@ -404,10 +404,22 @@ def load_and_preprocess(input_file, text_col_name, text_col_name_2, debug=False)
         if text_col_name not in input_df.columns or text_col_name_2 not in input_df.columns:
             if 'response' in input_df.columns:
                 logging.info("Flattening nested response fields into label/description columns")
-                response_df = pd.json_normalize(input_df['response'])
+                def normalize_response(resp):
+                    if isinstance(resp, dict):
+                        return resp
+                    if isinstance(resp, list):
+                        if resp and isinstance(resp[0], dict):
+                            return resp[0]
+                        return {}
+                    return {}
+
+                normalized = input_df['response'].apply(normalize_response)
+                response_df = pd.json_normalize(normalized)
                 input_df = pd.concat([input_df.drop(columns=['response']), response_df], axis=1)
             else:
                 raise KeyError(f"Missing required columns: {text_col_name}, {text_col_name_2}")
+        if text_col_name not in input_df.columns or text_col_name_2 not in input_df.columns:
+            raise KeyError(f"Missing required columns after flattening: {text_col_name}, {text_col_name_2}")
         input_df['text_col'] = '"' + input_df[text_col_name] + '": ' + input_df[text_col_name_2]
 
     return input_df
