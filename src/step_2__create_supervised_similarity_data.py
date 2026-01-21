@@ -401,6 +401,13 @@ def load_and_preprocess(input_file, text_col_name, text_col_name_2, debug=False)
     
     if text_col_name_2:
         logging.info(f"Combining columns {text_col_name} and {text_col_name_2}")
+        if text_col_name not in input_df.columns or text_col_name_2 not in input_df.columns:
+            if 'response' in input_df.columns:
+                logging.info("Flattening nested response fields into label/description columns")
+                response_df = pd.json_normalize(input_df['response'])
+                input_df = pd.concat([input_df.drop(columns=['response']), response_df], axis=1)
+            else:
+                raise KeyError(f"Missing required columns: {text_col_name}, {text_col_name_2}")
         input_df['text_col'] = '"' + input_df[text_col_name] + '": ' + input_df[text_col_name_2]
 
     return input_df
