@@ -109,14 +109,18 @@ def check_existing_outputs(output_fname, start_idx, end_idx):
     return False
 
 
-def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_per_prompt=8):
+def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_per_prompt=8, window_size=3):
     if not multi_sentence:
         all_responses = []
         g = input_df.groupby('doc_index')
         for doc_index, df in g:
             df = df[['sent_index', 'sentence_text']].sort_values('sent_index')
-            doc_text = df['sentence_text'].str.cat(sep=' ')
-            for _, (sent_index, sentence_text) in df.iterrows():
+            sent_texts = df['sentence_text'].tolist()
+            sent_indices = df['sent_index'].tolist()
+            for pos, (sent_index, sentence_text) in enumerate(zip(sent_indices, sent_texts)):
+                start = max(0, pos - window_size)
+                end = min(len(sent_texts), pos + window_size + 1)
+                doc_text = ' '.join(sent_texts[start:end])
                 all_responses.append({
                     'index': f'{doc_index.replace("/", "_")}__sent_index-{sent_index}',
                     'doc_text': doc_text,
@@ -134,10 +138,12 @@ def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_p
         g = input_df.groupby('doc_index')
         for doc_index, df in g:
             df = df[['sent_index', 'sentence_text']].sort_values('sent_index')
-            doc_text = df['sentence_text'].str.cat(sep=' ')
             sents = df['sentence_text'].tolist()
             
             for i in range(0, len(sents), num_sents_per_prompt):
+                start = max(0, i - window_size)
+                end = min(len(sents), i + num_sents_per_prompt + window_size)
+                doc_text = ' '.join(sents[start:end])
                 sents_chunk = sents[i: i + num_sents_per_prompt]
                 sents_chunk = list(map(lambda x: f"(idx {i + x[0]}) {x[1].replace(chr(10), ' ').strip()}", enumerate(sents_chunk)))
                 sents_chunk_text = '\n'.join(sents_chunk)
@@ -388,7 +394,12 @@ if __name__ == "__main__":
             prompts['response_format'] = MultiNewsDiscourseLabelingResponse if args.num_sents_per_prompt > 1 else NewsDiscourseLabelingResponse
     else:
         if args.experiment == 'editorials':
-            prompts = make_labeling_prompts_editorials(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
+            prompts = make_labeling_prompts_editorials(
+                input_df=input_df,
+                multi_sentence=args.num_sents_per_prompt > 1,
+                num_sents_per_prompt=args.num_sents_per_prompt,
+                window_size=args.window_size,
+            )
         elif args.experiment == 'emotions':
             prompts = make_labeling_prompts_emotions(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
         elif args.experiment == 'hate-speech':
