@@ -420,7 +420,15 @@ def load_and_preprocess(input_file, text_col_name, text_col_name_2, debug=False)
                 raise KeyError(f"Missing required columns: {text_col_name}, {text_col_name_2}")
         if text_col_name not in input_df.columns or text_col_name_2 not in input_df.columns:
             raise KeyError(f"Missing required columns after flattening: {text_col_name}, {text_col_name_2}")
-        input_df['text_col'] = '"' + input_df[text_col_name] + '": ' + input_df[text_col_name_2]
+        before = len(input_df)
+        text_part_1 = input_df[text_col_name].astype(str).str.strip()
+        text_part_2 = input_df[text_col_name_2].astype(str).str.strip()
+        input_df['text_col'] = '"' + text_part_1 + '": ' + text_part_2
+        input_df = input_df[input_df['text_col'].notna() & (input_df['text_col'].str.len() > 0)]
+        after = len(input_df)
+        logging.info(f"Filtered {before - after} rows with missing label/description")
+        if after < 2:
+            raise ValueError("Not enough valid label/description rows to compute similarities")
 
     return input_df
 
