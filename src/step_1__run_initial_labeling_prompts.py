@@ -31,6 +31,7 @@ import torch
 import logging
 import random
 import spacy
+import math
 from prompts import (
     EDITORIAL_INITIAL_LABELING_PROMPT, 
     MULTI_SENTENCE_EDITORIAL_LABELING_PROMPT,
@@ -465,32 +466,42 @@ if __name__ == "__main__":
 
     else:
         # Process in batches with VLLM
-        num_batches = (args.end_idx - args.start_idx) // args.batch_size
-        batch_indices = [(i * args.batch_size, min((i + 1) * args.batch_size, args.end_idx)) for i in range(num_batches)]
+        batch_indices = [
+            (start_idx, min(start_idx + args.batch_size, args.end_idx))
+            for start_idx in range(args.start_idx, args.end_idx, args.batch_size)
+        ]
         random.shuffle(batch_indices)
         response_format = prompts['response_format'].iloc[0]
 
         logging.info(f'running prompts for {args.end_idx - args.start_idx} rows')
-        for start_idx, end_idx in tqdm(batch_indices):
-            output_fname = f'{out_dirname}/{fname}-labeling__experiment-{args.experiment}__model_{args.model.replace("/", "-")}__{start_idx}_{end_idx}{fext}'
-            
-            # Check if we already have results for this batch
-            if check_existing_outputs(output_fname, start_idx, end_idx):
-                logging.info(f"Skipping batch {start_idx} to {end_idx} as results already exist")
-                continue
+        try:
+            for start_idx, end_idx in tqdm(batch_indices):
+                output_fname = f'{out_dirname}/{fname}-labeling__experiment-{args.experiment}__model_{args.model.replace("/", "-")}__{start_idx}_{end_idx}{fext}'
                 
-            logging.info(f"Running prompts for batch {start_idx} to {end_idx}")
-            prompts_to_run = prompts.iloc[start_idx: end_idx]
-            # create an empty file to indicate that this batch is being processed
-            with open(output_fname, 'w') as f:
-                f.write('')
-            inputted_prompts, model_outputs, outputs = process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=GuidedDecodingParams)
-            write_to_file(
-                output_fname,
-                indices=prompts_to_run['index'].tolist(),
-                outputs=outputs
-            )
-            logging.info(f'-----------\nsample output: {model_outputs[0]}\n-----------\n')
+                # Check if we already have results for this batch
+                if check_existing_outputs(output_fname, start_idx, end_idx):
+                    logging.info(f"Skipping batch {start_idx} to {end_idx} as results already exist")
+                    continue
+                    
+                logging.info(f"Running prompts for batch {start_idx} to {end_idx}")
+                prompts_to_run = prompts.iloc[start_idx: end_idx]
+                # create an empty file to indicate that this batch is being processed
+                with open(output_fname, 'w') as f:
+                    f.write('')
+                inputted_prompts, model_outputs, outputs = process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=GuidedDecodingParams)
+                write_to_file(
+                    output_fname,
+                    indices=prompts_to_run['index'].tolist(),
+                    outputs=outputs
+                )
+                logging.info(f'-----------\nsample output: {model_outputs[0]}\n-----------\n')
+        finally:
+            # Best-effort cleanup to avoid vLLM shutdown warnings.
+            if hasattr(model, "llm_engine") and hasattr(model.llm_engine, "shutdown"):
+                try:
+                    model.llm_engine.shutdown()
+                except Exception as exc:
+                    logging.warning(f"Failed to shut down vLLM engine cleanly: {exc}")
 
 """
 python step_1__run_initial_labeling_prompts.py \
