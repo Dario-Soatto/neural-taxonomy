@@ -6,6 +6,9 @@ from collections import Counter
 from typing import List, Dict, Tuple, Optional
 import argparse
 import json
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 def compute_ari(cluster_labels: np.ndarray, ground_truth: np.ndarray) -> float:
     """
