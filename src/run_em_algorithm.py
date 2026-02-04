@@ -13,14 +13,14 @@ from em_scores import compute_document_level_scores, compute_corpus_level_scores
 
 # --- EM Refinement Constants ---
 # For decide_schema_updates
-SIMILARITY_THRESHOLD_MERGE = 0.9  # Cosine similarity for merging cluster centroids
+SIMILARITY_THRESHOLD_MERGE = 0.8  # Cosine similarity for merging cluster centroids
 MIN_CLUSTER_SIZE_REMOVE = 5     # Minimum number of items for a cluster to be kept
 BASELINE_LL_FACTOR_REMOVE = 1.01 # Factor for L_z vs L_baseline for removal (L_z < L_baseline * FACTOR)
 BASELINE_LL_FACTOR_SPLIT = 0.9   # Factor for L_z vs L_baseline for splitting (L_z < L_baseline * FACTOR)
 CONFIDENCE_THRESHOLD_SPLIT = 0.4 # Minimum posterior confidence C(z) for splitting
 # For em_schema_refinement (Add step)
-LOW_CONFIDENCE_THRESHOLD_ADD = 0.1 # Max p(z|x) for a text to be considered poorly explained
-MIN_POORLY_EXPLAINED_FOR_ADD = 10  # Min number of poorly explained texts to trigger new cluster formation
+LOW_CONFIDENCE_THRESHOLD_ADD = 0.2 # Max p(z|x) for a text to be considered poorly explained
+MIN_POORLY_EXPLAINED_FOR_ADD = 5  # Min number of poorly explained texts to trigger new cluster formation
 ITEMS_PER_NEW_CLUSTER_ADD = 50   # Heuristic: 1 new cluster per this many poorly explained items
 
 DEFAULT_BASELINE_SAMPLE_SIZE = 500 # Default sample size for baseline P(x) calculation
@@ -33,6 +33,27 @@ except ImportError:
         from utils_probability_calibrator import ProbabilityCalibrator, initialize_probability_calibrator
     except ImportError:
         raise ImportError("Failed to import ProbabilityCalibrator and initialize_probability_calibrator. Please check your project structure and PYTHONPATH.")
+
+def rebuild_calibrator_with_existing_backend(
+    existing_calibrator: ProbabilityCalibrator,
+    new_choices: list[str],
+    verbose: bool = False,
+) -> ProbabilityCalibrator:
+    """
+    Rebuild a calibrator with new choices while reusing the existing scorer functions.
+    This avoids reloading the underlying model (important for vLLM GPU memory).
+    """
+    return ProbabilityCalibrator(
+        choices=new_choices,
+        logprob_scorer=existing_calibrator.logprob_scorer,
+        full_logprob_fn=existing_calibrator.full_logprob_fn,
+        num_trials=existing_calibrator.num_trials,
+        content_free_input=existing_calibrator.content_free_input,
+        alpha=existing_calibrator.alpha,
+        verbose=verbose,
+        batch_prompts=existing_calibrator.batch_prompts,
+        batch_permutations=existing_calibrator.batch_permutations,
+    )
 
 
 def setup_logging():
@@ -199,21 +220,21 @@ def load_and_prepare_data(sentence_data_path: Path, selected_level_assignments_p
     return merged_df, choices_list
 
 
-def compute_sentence_embeddings(texts: list[str], model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 64):
+def compute_sentence_embeddings(texts: list[str], model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 64, show_progress: bool = False):
     """Returns a numpy array (len(texts), dim) of embeddings using SentenceTransformer."""
     from sentence_transformers import SentenceTransformer
     logging.info(f"Loading SentenceTransformer model: {model_name}")
     st_model = SentenceTransformer(model_name)
-    embeddings = st_model.encode(texts, batch_size=batch_size, convert_to_numpy=True, show_progress_bar=True)
+    embeddings = st_model.encode(texts, batch_size=batch_size, convert_to_numpy=True, show_progress_bar=show_progress)
     return embeddings
 
 
-def score_dataframe_sentences(calibrator: ProbabilityCalibrator, data_df: pd.DataFrame, text_column: str, choices_list_for_output: list[str]) -> pd.DataFrame:
+def score_dataframe_sentences(calibrator: ProbabilityCalibrator, data_df: pd.DataFrame, text_column: str, choices_list_for_output: list[str], show_progress: bool = False) -> pd.DataFrame:
     """Scores sentences in the DataFrame using the provided calibrator."""
     logging.info(f"Scoring sentences from column: '{text_column}'...")
     results_list = []
 
-    for _, row in tqdm(data_df.iterrows(), total=len(data_df), desc="Scoring sentences"):
+    for _, row in tqdm(data_df.iterrows(), total=len(data_df), desc="Scoring sentences", disable=not show_progress):
         sentence_text = str(row[text_column])
         try:
             probabilities = calibrator.calibrate_p_z_given_X(sentence_text)
@@ -265,7 +286,7 @@ def compute_cluster_metrics(
     # Determine the iterator for clusters, potentially with tqdm
     cluster_groups = merged_df.groupby('cluster_id')
     if verbose:
-        cluster_iterator = tqdm(cluster_groups, desc="Computing cluster metrics", unit="cluster")
+        cluster_iterator = tqdm(cluster_groups, desc="Computing cluster metrics", unit="cluster", disable=False)
     else:
         cluster_iterator = cluster_groups
 
@@ -353,7 +374,7 @@ def compute_cluster_metrics(
     return cluster_metrics
 
 
-def decide_schema_updates(cluster_metrics: dict):
+def decide_schema_updates(cluster_metrics: dict, verbose: bool = False, log_top_pairs: int = 0):
     """Determine which clusters to split, merge, remove. Returns dictionaries describing actions."""
     logging.info("Starting schema update decisions...")
     actions = {'split': [], 'merge': [], 'remove': []}
@@ -367,22 +388,40 @@ def decide_schema_updates(cluster_metrics: dict):
         return actions
 
     median_V_z = np.median([cluster_metrics[cid]['V_z'] for cid in valid_cluster_ids if 'V_z' in cluster_metrics[cid]])
-    logging.info(f"Using L_baseline={baseline_log_px:.4f}, Median V_z={median_V_z:.4f} for decisions.")
+    logging.info(
+        f"Using L_baseline={baseline_log_px:.4f}, Median V_z={median_V_z:.4f} for decisions. "
+        f"Thresholds: remove if size<{MIN_CLUSTER_SIZE_REMOVE} and L_z<{baseline_log_px * BASELINE_LL_FACTOR_REMOVE:.4f}; "
+        f"split if L_z<{baseline_log_px * BASELINE_LL_FACTOR_SPLIT:.4f} and C_z<{CONFIDENCE_THRESHOLD_SPLIT:.2f} and V_z>median. "
+        f"merge if cosine_sim>={SIMILARITY_THRESHOLD_MERGE:.2f}."
+    )
+
+    # Track margins to understand how close we are to thresholds
+    split_margins = []
+    remove_margins = []
 
     # --- SPLIT & REMOVE ---
     for cid in valid_cluster_ids:
         m = cluster_metrics[cid]
+        # Per-cluster threshold diagnostics
+        logging.info(
+            f"Cluster {cid} ('{m.get('label','N/A')}'): "
+            f"L_z={m['L_z']:.4f}, C_z={m['C_z']:.4f}, V_z={m['V_z']:.4f}, size={m['size']}. "
+            f"remove_thresh={baseline_log_px * BASELINE_LL_FACTOR_REMOVE:.4f}, "
+            f"split_thresh={baseline_log_px * BASELINE_LL_FACTOR_SPLIT:.4f}"
+        )
         # Removal Check
         if m['size'] < MIN_CLUSTER_SIZE_REMOVE and m['L_z'] < baseline_log_px * BASELINE_LL_FACTOR_REMOVE:
             actions['remove'].append(cid)
             logging.info(f"  Suggest REMOVE for cluster {cid} ('{m.get('label', 'N/A')}'): size {m['size']} < {MIN_CLUSTER_SIZE_REMOVE} AND L_z {m['L_z']:.4f} < baseline_thresh {baseline_log_px * BASELINE_LL_FACTOR_REMOVE:.4f}.")
             continue # If removed, don't consider for split
+        remove_margins.append(m['L_z'] - (baseline_log_px * BASELINE_LL_FACTOR_REMOVE))
         # Split Check
         if m['L_z'] < baseline_log_px * BASELINE_LL_FACTOR_SPLIT and \
            m['C_z'] < CONFIDENCE_THRESHOLD_SPLIT and \
            m['V_z'] > median_V_z:
             actions['split'].append(cid)
             logging.info(f"  Suggest SPLIT for cluster {cid} ('{m.get('label', 'N/A')}'): L_z {m['L_z']:.4f} < thresh {baseline_log_px * BASELINE_LL_FACTOR_SPLIT:.4f} AND C_z {m['C_z']:.4f} < {CONFIDENCE_THRESHOLD_SPLIT} AND V_z {m['V_z']:.4f} > median_V_z {median_V_z:.4f}.")
+        split_margins.append(m['L_z'] - (baseline_log_px * BASELINE_LL_FACTOR_SPLIT))
 
     # --- MERGE ---
     # Filter out clusters already marked for removal or split before considering for merge
@@ -396,6 +435,7 @@ def decide_schema_updates(cluster_metrics: dict):
         sim_matrix = cent_norm @ cent_norm.T
         n = len(eligible_for_merge_ids)
         merged_already = set()
+        top_pairs = []
         for i in range(n):
             if eligible_for_merge_ids[i] in merged_already:
                 continue
@@ -406,7 +446,10 @@ def decide_schema_updates(cluster_metrics: dict):
                 id_i = eligible_for_merge_ids[i]
                 id_j = eligible_for_merge_ids[j]
                 
-                if sim_matrix[i, j] >= SIMILARITY_THRESHOLD_MERGE:
+                sim_val = sim_matrix[i, j]
+                if log_top_pairs > 0:
+                    top_pairs.append((sim_val, id_i, id_j))
+                if sim_val >= SIMILARITY_THRESHOLD_MERGE:
                     m_i = cluster_metrics[id_i]
                     m_j = cluster_metrics[id_j]
                     diff_L = abs(m_i['L_z'] - m_j['L_z'])
@@ -417,13 +460,155 @@ def decide_schema_updates(cluster_metrics: dict):
                         actions['merge'].append(tuple(sorted((id_i, id_j)))) # Store sorted tuple to avoid duplicates like (B,A) if (A,B) decided
                         merged_already.add(id_i)
                         merged_already.add(id_j)
-                        logging.info(f"  Suggest MERGE for clusters {id_i} ('{m_i.get('label', 'N/A')}') and {id_j} ('{m_j.get('label', 'N/A')}'): Similarity {sim_matrix[i,j]:.4f} >= {SIMILARITY_THRESHOLD_MERGE}, L_diff {diff_L:.4f}, C_diff {diff_C:.4f}.")
+                        logging.info(f"  Suggest MERGE for clusters {id_i} ('{m_i.get('label', 'N/A')}') and {id_j} ('{m_j.get('label', 'N/A')}'): Similarity {sim_val:.4f} >= {SIMILARITY_THRESHOLD_MERGE}, L_diff {diff_L:.4f}, C_diff {diff_C:.4f}.")
                         break # Merge id_i with one cluster, then move to next i
     
     # Deduplicate merge pairs (if (A,B) and (B,A) somehow got in)
     actions['merge'] = sorted(list(set(actions['merge'])))
+    if verbose:
+        if remove_margins:
+            logging.info(f"Remove margin (L_z - remove_thresh) min/median/max: "
+                         f"{np.min(remove_margins):.4f}/{np.median(remove_margins):.4f}/{np.max(remove_margins):.4f}")
+        if split_margins:
+            logging.info(f"Split margin (L_z - split_thresh) min/median/max: "
+                         f"{np.min(split_margins):.4f}/{np.median(split_margins):.4f}/{np.max(split_margins):.4f}")
+        if log_top_pairs > 0 and top_pairs:
+            top_pairs.sort(reverse=True, key=lambda x: x[0])
+            logging.info(f"Top-{log_top_pairs} merge candidate similarities:")
+            for sim_val, id_i, id_j in top_pairs[:log_top_pairs]:
+                m_i = cluster_metrics[id_i]
+                m_j = cluster_metrics[id_j]
+                diff_L = abs(m_i['L_z'] - m_j['L_z'])
+                diff_C = abs(m_i['C_z'] - m_j['C_z'])
+                logging.info(
+                    f"  pair ({id_i}, {id_j}) sim={sim_val:.4f} "
+                    f"L_diff={diff_L:.4f} C_diff={diff_C:.4f} "
+                    f"labels=('{m_i.get('label','N/A')}', '{m_j.get('label','N/A')}')"
+                )
     logging.info(f"Finished schema update decisions. Actions: {actions}")
     return actions
+
+
+def _plot_histogram(values, title, xlabel, output_path, bins=40):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if values is None or len(values) == 0:
+        return
+    plt.figure(figsize=(8, 5))
+    plt.hist(values, bins=bins, color="#4C78A8", alpha=0.85)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def run_probability_diagnostics(
+    prob_calibrator,
+    merged_df: pd.DataFrame,
+    text_column_name: str,
+    choices_list: list[str],
+    output_dir: Path,
+    iteration_idx: int,
+    sample_size: int = 200,
+    bins: int = 40,
+):
+    """Sample probabilities and write histograms/CSV for calibration inspection."""
+    if text_column_name not in merged_df.columns:
+        logging.warning(f"Diagnostics skipped: text column '{text_column_name}' not found.")
+        return
+
+    if not choices_list:
+        logging.warning("Diagnostics skipped: empty choices list.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(13 + iteration_idx)
+
+    sample_size = min(sample_size, len(merged_df))
+    sample_indices = rng.choice(merged_df.index.to_numpy(), size=sample_size, replace=False)
+    sample_df = merged_df.loc[sample_indices]
+
+    # p(z) prior: prefer calibrator.p_z if available, else from empirical cluster counts
+    p_z_prior = getattr(prob_calibrator, "p_z", None)
+    if p_z_prior is None or len(p_z_prior) != len(choices_list):
+        if "agglomerative_label" in merged_df.columns:
+            counts = merged_df["agglomerative_label"].value_counts()
+            p_z_prior = np.array([counts.get(c, 0) for c in choices_list], dtype=float)
+            p_z_prior = p_z_prior / p_z_prior.sum() if p_z_prior.sum() > 0 else np.ones(len(choices_list)) / len(choices_list)
+        else:
+            p_z_prior = np.ones(len(choices_list)) / len(choices_list)
+
+    label_to_idx = {str(lbl): i for i, lbl in enumerate(choices_list)}
+
+    pmax_vals = []
+    entropy_vals = []
+    top_gap_vals = []
+    pxz_max_vals = []
+    assigned_pzx_vals = []
+    log_px_vals = []
+
+    rows = []
+    for _, row in sample_df.iterrows():
+        txt = row[text_column_name]
+        pzx = np.array(prob_calibrator.calibrate_p_z_given_X(txt), dtype=float)
+        if pzx.size == 0:
+            continue
+        pzx = np.clip(pzx, 1e-12, 1.0)
+        pzx = pzx / pzx.sum()
+        pmax = float(pzx.max())
+        pmax_vals.append(pmax)
+        entropy_vals.append(float(-np.sum(pzx * np.log(pzx))))
+
+        sorted_probs = np.sort(pzx)[::-1]
+        top_gap = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else 0.0
+        top_gap_vals.append(top_gap)
+
+        pxz = bayes_px_given_z_normalized(pzx, p_z_prior)
+        pxz_max_vals.append(float(np.max(pxz)))
+
+        assigned_label = row.get("agglomerative_label")
+        assigned_pzx = None
+        if assigned_label is not None:
+            assigned_idx = label_to_idx.get(str(assigned_label))
+            if assigned_idx is not None and assigned_idx < len(pzx):
+                assigned_pzx = float(pzx[assigned_idx])
+                assigned_pzx_vals.append(assigned_pzx)
+
+        log_px = None
+        if getattr(prob_calibrator, "full_logprob_fn", None) is not None:
+            try:
+                log_px = float(prob_calibrator.full_logprob_fn(str(txt)))
+                log_px_vals.append(log_px)
+            except Exception as exc:
+                logging.warning(f"full_logprob_fn failed on diagnostics sample: {exc}")
+
+        rows.append({
+            "index": int(row.name),
+            "pmax": pmax,
+            "entropy": entropy_vals[-1],
+            "top1_top2_gap": top_gap,
+            "pxz_max": pxz_max_vals[-1],
+            "assigned_label": assigned_label,
+            "assigned_pzx": assigned_pzx,
+            "log_px": log_px,
+        })
+
+    diag_df = pd.DataFrame(rows)
+    diag_csv = output_dir / f"em_diag_iter_{iteration_idx:02d}.csv"
+    diag_df.to_csv(diag_csv, index=False)
+
+    _plot_histogram(pmax_vals, f"p(z|x) max (iter {iteration_idx})", "pmax", output_dir / f"hist_pmax_iter_{iteration_idx:02d}.png", bins=bins)
+    _plot_histogram(entropy_vals, f"p(z|x) entropy (iter {iteration_idx})", "entropy", output_dir / f"hist_entropy_iter_{iteration_idx:02d}.png", bins=bins)
+    _plot_histogram(top_gap_vals, f"p(z|x) top1-top2 gap (iter {iteration_idx})", "gap", output_dir / f"hist_topgap_iter_{iteration_idx:02d}.png", bins=bins)
+    _plot_histogram(pxz_max_vals, f"p(x|z) max (iter {iteration_idx})", "pxz_max", output_dir / f"hist_pxz_max_iter_{iteration_idx:02d}.png", bins=bins)
+    _plot_histogram(assigned_pzx_vals, f"p(z|x) assigned label (iter {iteration_idx})", "assigned_pzx", output_dir / f"hist_assigned_pzx_iter_{iteration_idx:02d}.png", bins=bins)
+    if log_px_vals:
+        _plot_histogram(log_px_vals, f"log p(x) (iter {iteration_idx})", "log_px", output_dir / f"hist_log_px_iter_{iteration_idx:02d}.png", bins=bins)
+    _plot_histogram(p_z_prior, f"p(z) prior (iter {iteration_idx})", "p_z", output_dir / f"hist_pz_prior_iter_{iteration_idx:02d}.png", bins=min(bins, len(p_z_prior)))
 
 
 def apply_schema_updates(merged_df: pd.DataFrame, embeddings: np.ndarray, actions: dict, next_new_cluster_id: int) -> tuple[pd.DataFrame, int]:
@@ -506,8 +691,17 @@ def em_schema_refinement(
         embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         baseline_sample_size: int = DEFAULT_BASELINE_SAMPLE_SIZE,
         verbose: bool = False,
-        max_texts_per_cluster_metrics: int = DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS
-    ):
+        max_texts_per_cluster_metrics: int = DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS,
+        show_progress: bool = False,
+        log_iteration_metrics: bool = False,
+        log_top_pairs: int = 0,
+        diagnostics_sample_size: int = 200,
+        diagnostics_bins: int = 40,
+        diagnostics_dir: Path | None = None,
+        low_confidence_threshold_add: float = LOW_CONFIDENCE_THRESHOLD_ADD,
+        min_poorly_explained_for_add: int = MIN_POORLY_EXPLAINED_FOR_ADD,
+        items_per_new_cluster_add: int = ITEMS_PER_NEW_CLUSTER_ADD,
+): 
     """Run an EM-like schema refinement loop, returning updated merged_df and history of schema changes."""
     logging.info(f"Starting EM-style schema refinement for {max_iters} iterations...")
     logging.info(f"Computing initial sentence embeddings using {embedding_model_name}...")
@@ -515,7 +709,11 @@ def em_schema_refinement(
     # Create a mapping from the original DataFrame index to 0-based positions for the embeddings array
     # This assumes current_merged_df's index at this point is the reference for all_embeddings
     idx_to_emb_pos_map = {original_idx: pos for pos, original_idx in enumerate(merged_df.index)}
-    all_embeddings = compute_sentence_embeddings(merged_df[text_column_name].tolist(), model_name=embedding_model_name)
+    all_embeddings = compute_sentence_embeddings(
+        merged_df[text_column_name].tolist(),
+        model_name=embedding_model_name,
+        show_progress=show_progress,
+    )
 
     current_merged_df = merged_df.copy()
     current_choices_list = list(choices_list)
@@ -567,7 +765,7 @@ def em_schema_refinement(
                     f"PPL={corpus_scores['perplexity']:.3f}, "
                     f"ELBO={corpus_scores['ELBO']}")  
     else:
-        logging.warning("  Dataset is empty or too small for baseline sample, cannot compute baseline log p(x). Using {baseline_log_px}.")
+        logging.warning(f"  Dataset is empty or too small for baseline sample, cannot compute baseline log p(x). Using {baseline_log_px}.")
 
     for iter_idx in range(max_iters):
         logging.info(f"=== EM Iteration {iter_idx + 1}/{max_iters} ===")
@@ -588,7 +786,20 @@ def em_schema_refinement(
             max_texts_per_cluster_metrics=max_texts_per_cluster_metrics,
             p_z_prior=doc_scores["pz_prior"] if 'doc_scores' in locals() else None
         )
-        actions = decide_schema_updates(cluster_metrics)
+        # Diagnostics (probability calibration)
+        if diagnostics_dir is not None:
+            run_probability_diagnostics(
+                current_prob_calibrator,
+                current_merged_df,
+                text_column_name,
+                current_choices_list,
+                diagnostics_dir,
+                iter_idx + 1,
+                sample_size=diagnostics_sample_size,
+                bins=diagnostics_bins,
+            )
+
+        actions = decide_schema_updates(cluster_metrics, verbose=verbose, log_top_pairs=log_top_pairs)
         iteration_actions.update(actions)
         logging.info(f"Iteration {iter_idx + 1}: Actions decided from metrics (Split/Merge/Remove): {actions}. 'Add' actions to be determined next.")
         current_merged_df, next_new_cluster_id = apply_schema_updates(current_merged_df, all_embeddings, actions, next_new_cluster_id)
@@ -626,16 +837,24 @@ def em_schema_refinement(
 
         logging.info(f"Iteration {iter_idx + 1}: Identifying poorly explained texts for potential new clusters.")
         poor_indices = []
+        pmax_vals = []
         for original_idx in current_merged_df.index:
             sentence_text = current_merged_df.loc[original_idx, text_column_name]
             probabilities = current_prob_calibrator.calibrate_p_z_given_X(sentence_text)
-            if not probabilities.any() or probabilities.max() < LOW_CONFIDENCE_THRESHOLD_ADD:
+            pmax = float(np.max(probabilities)) if hasattr(probabilities, "__len__") and len(probabilities) > 0 else 0.0
+            pmax_vals.append(pmax)
+            if not probabilities.any() or pmax < low_confidence_threshold_add:
                 poor_indices.append(original_idx)
+        if pmax_vals:
+            logging.info(
+                f"  pmax stats vs add-threshold {low_confidence_threshold_add}: "
+                f"min/median/max={np.min(pmax_vals):.4f}/{np.median(pmax_vals):.4f}/{np.max(pmax_vals):.4f}"
+            )
         added_clusters_info = []
-        if len(poor_indices) >= MIN_POORLY_EXPLAINED_FOR_ADD:
-            logging.info(f"  Found {len(poor_indices)} texts poorly explained (max p(z|x) < {LOW_CONFIDENCE_THRESHOLD_ADD}). Attempting to form new clusters.")
+        if len(poor_indices) >= min_poorly_explained_for_add:
+            logging.info(f"  Found {len(poor_indices)} texts poorly explained (max p(z|x) < {low_confidence_threshold_add}). Attempting to form new clusters.")
             emb_poor = all_embeddings[poor_indices]
-            num_new_clusters_to_add = max(1, len(poor_indices) // ITEMS_PER_NEW_CLUSTER_ADD)
+            num_new_clusters_to_add = max(1, len(poor_indices) // items_per_new_cluster_add)
             logging.info(f"  Attempting to create {num_new_clusters_to_add} new clusters from these texts.")
             from sklearn.cluster import KMeans
             if len(emb_poor) < num_new_clusters_to_add:
@@ -659,7 +878,7 @@ def em_schema_refinement(
             else:
                 logging.info("  No new clusters to add based on poor text count or KMeans failure.")
         else:
-            logging.info(f"  Found {len(poor_indices)} poorly explained texts (threshold: {MIN_POORLY_EXPLAINED_FOR_ADD}). Not adding new clusters based on this criterion.")
+            logging.info(f"  Found {len(poor_indices)} poorly explained texts (threshold: {min_poorly_explained_for_add}). Not adding new clusters based on this criterion.")
         iteration_actions['add'] = added_clusters_info
         logging.info(f"Iteration {iter_idx + 1}: 'Add' actions decided: {added_clusters_info}. Total actions for iteration: {iteration_actions}")
         schema_history.append(iteration_actions)
@@ -681,18 +900,60 @@ def em_schema_refinement(
             current_choices_list.append(label)
             temp_label_map[cid_val] = label
         current_merged_df['agglomerative_label'] = current_merged_df['cluster_id'].map(temp_label_map)
+
+        # IMPORTANT: keep calibrator choices aligned with current schema before any metric recomputation.
         if set(current_prob_calibrator.choices) != set(current_choices_list):
             logging.info(f"Iteration {iter_idx + 1}: Re-initializing ProbabilityCalibrator with {len(current_choices_list)} choices: {current_choices_list}")
-            current_prob_calibrator = initialize_probability_calibrator(
-                model_identifier=model_identifier,
-                model_type=model_type,
-                choices=current_choices_list,
-                num_trials=current_prob_calibrator.num_trials,
-                scorer_type="batch" if current_prob_calibrator.batch_prompts is False else "single",
-                verbose=verbose
-            )
+            try:
+                current_prob_calibrator = rebuild_calibrator_with_existing_backend(
+                    current_prob_calibrator,
+                    current_choices_list,
+                    verbose=verbose,
+                )
+                logging.info("Iteration %s: Reused existing backend/scorer to refresh calibrator choices.", iter_idx + 1)
+            except Exception as e:
+                logging.warning(
+                    f"Iteration {iter_idx + 1}: In-place calibrator rebuild failed ({e}). "
+                    "Falling back to full re-initialization."
+                )
+                current_prob_calibrator = initialize_probability_calibrator(
+                    model_identifier=model_identifier,
+                    model_type=model_type,
+                    choices=current_choices_list,
+                    num_trials=current_prob_calibrator.num_trials,
+                    scorer_type="batch" if current_prob_calibrator.batch_prompts is False else "single",
+                    verbose=verbose
+                )
         else:
             logging.info(f"Iteration {iter_idx + 1}: Choices unchanged; reusing existing ProbabilityCalibrator.")
+
+        if log_iteration_metrics:
+            doc_scores_iter = compute_document_level_scores(
+                df=current_merged_df,
+                text_col=text_column_name,
+                cluster_col="agglomerative_label",
+                choices=current_choices_list,
+                prob_calibrator=current_prob_calibrator,
+                embeddings=all_embeddings if 'all_embeddings' in locals() else None,
+                p_z_prior=getattr(current_prob_calibrator, "p_z", None),
+            )
+            corpus_scores_iter = compute_corpus_level_scores(
+                log_px_given_z_hat=doc_scores_iter["row_log_px_given_z_norm"][np.arange(len(current_merged_df)),
+                                                                            doc_scores_iter["row_z_hat"]],
+                token_counts=None,
+                k_complexity=len(current_choices_list),
+                is_test_mask=None,
+                q_ij=doc_scores_iter["PZX"],
+                log_px_given_z=doc_scores_iter["row_log_px_given_z_norm"],
+                log_pz=np.log(np.clip(doc_scores_iter["pz_prior"], 1e-30, None)),
+            )
+            logging.info(
+                f"[Iter {iter_idx + 1}] L_baseline={doc_scores_iter['L_baseline']:.4f}, "
+                f"logL_total={corpus_scores_iter['logL_cond_total']:.2f}, "
+                f"AIC={corpus_scores_iter['AIC']}, BIC={corpus_scores_iter['BIC']}, "
+                f"PPL={corpus_scores_iter['perplexity']:.3f}, "
+                f"ELBO={corpus_scores_iter['ELBO']}"
+            )
         logging.info(f"=== EM Iteration {iter_idx + 1} Complete. #Clusters: {len(unique_cluster_ids_after_iter)} ===")
 
         # Log P(z) for the current schema labels if verbose
@@ -761,6 +1022,7 @@ def main(args):
 
     # 4.5 EM-style schema refinement (optional)
     if args.num_iterations > 0:
+        diagnostics_dir = Path(args.diagnostics_dir) if args.diagnostics_dir else Path(args.experiment_dir) / "em_diagnostics"
         merged_df, schema_history, choices_list, prob_calibrator = em_schema_refinement(
             merged_df,
             prob_calibrator,
@@ -772,7 +1034,16 @@ def main(args):
             embedding_model_name=args.embedding_model_name,
             baseline_sample_size=args.baseline_sample_size,
             verbose=args.verbose,
-            max_texts_per_cluster_metrics=args.max_texts_per_cluster_metrics
+            max_texts_per_cluster_metrics=args.max_texts_per_cluster_metrics,
+            show_progress=args.show_progress,
+            log_iteration_metrics=args.log_iteration_metrics,
+            log_top_pairs=args.log_top_pairs,
+            diagnostics_sample_size=args.diagnostics_sample_size,
+            diagnostics_bins=args.diagnostics_bins,
+            diagnostics_dir=diagnostics_dir,
+            low_confidence_threshold_add=args.low_confidence_threshold_add,
+            min_poorly_explained_for_add=args.min_poorly_explained_for_add,
+            items_per_new_cluster_add=args.items_per_new_cluster_add,
         )
         logging.info(f"EM schema refinement completed. Schema history: {schema_history}")
 
@@ -784,7 +1055,8 @@ def main(args):
         prob_calibrator,
         merged_df,
         args.sentence_column_name,
-        choices_list
+        choices_list,
+        show_progress=args.show_progress,
     )
 
     # 6. Save Results
@@ -816,6 +1088,15 @@ if __name__ == "__main__":
     parser.add_argument("--baseline_sample_size", type=int, default=DEFAULT_BASELINE_SAMPLE_SIZE, help="Sample size for calculating baseline P(x) during EM refinement.")
     parser.add_argument("--max_texts_per_cluster_metrics", type=int, default=DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS, help="Max texts per cluster to use for metrics calculation (-1 for no limit).")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging of probabilities at each EM iteration.")
+    parser.add_argument("--show_progress", action="store_true", help="Show tqdm progress bars.")
+    parser.add_argument("--log_iteration_metrics", action="store_true", help="Log ELBO/AIC/BIC per iteration.")
+    parser.add_argument("--log_top_pairs", type=int, default=0, help="Log top-N merge candidate similarities per iteration.")
+    parser.add_argument("--diagnostics_sample_size", type=int, default=200, help="Number of rows to sample for probability diagnostics per iteration.")
+    parser.add_argument("--diagnostics_bins", type=int, default=40, help="Histogram bins for diagnostics plots.")
+    parser.add_argument("--diagnostics_dir", type=str, default="", help="Output directory for EM diagnostics (defaults to <experiment_dir>/em_diagnostics).")
+    parser.add_argument("--low_confidence_threshold_add", type=float, default=LOW_CONFIDENCE_THRESHOLD_ADD, help="Add-step threshold on max p(z|x). Higher values mark more rows as poorly explained.")
+    parser.add_argument("--min_poorly_explained_for_add", type=int, default=MIN_POORLY_EXPLAINED_FOR_ADD, help="Minimum poorly explained rows needed before creating new clusters.")
+    parser.add_argument("--items_per_new_cluster_add", type=int, default=ITEMS_PER_NEW_CLUSTER_ADD, help="Heuristic scale: one new cluster per this many poorly explained rows.")
 
     args = parser.parse_args()
     main(args)

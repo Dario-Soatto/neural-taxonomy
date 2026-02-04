@@ -14,11 +14,18 @@ import tooldantic as td
 ############################
 
 GENERIC_SIMILARITY_PROMPT = """
-  I will show you {k_i} pairs of of labels, all describing some aspect of text.
-  
+  I will show you {k_i} pairs of labels, all describing some aspect of text.
+
   Are the two labels in each pair describing similar concepts?
   Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
-  Answer with "Yes" or "No". Answer each in a JSON in the format:
+  Answer with "Yes" or "No".
+  Return ONLY valid JSON in this exact format (use double quotes everywhere):
+  {{
+    "pairs": [
+      {{ "pair_idx": 1, "label": "Yes" }},
+      {{ "pair_idx": 2, "label": "No" }}
+    ]
+  }}
 """
 
 MATHEMATICAL_REASONING_SIMILARITY_PROMPT = """
@@ -26,10 +33,13 @@ MATHEMATICAL_REASONING_SIMILARITY_PROMPT = """
 
   Are the two labels in each pair describing similar reasoning steps in mathematical problem solving?
   Think broadly about what each label is describing. Don't pay attention to the specific step each label is describing.
-  Answer with "Yes" or "No". Answer each in a JSON in the format:
+  Answer with "Yes" or "No".
+  Return ONLY valid JSON in this exact format (use double quotes everywhere):
   {{
-    "pair_idx": PAIR_IDX,
-    "label": 'Yes' or 'No'
+    "pairs": [
+      {{ "pair_idx": 1, "label": "Yes" }},
+      {{ "pair_idx": 2, "label": "No" }}
+    ]
   }}
 
   <example>
@@ -38,25 +48,15 @@ MATHEMATICAL_REASONING_SIMILARITY_PROMPT = """
   3. Label 1: ```"Elimination": This step considers the centroid as a potential solution but quickly dismisses it.``` Label 2: ```"Meta-reflection": This step involves reflecting on the reasoning process itself, recognizing a past mistake, and understanding how the correct process leads to the correct solution.```
   4. Label 1: ```"Factoring": This step applies the factoring technique to simplify the equation, breaking it down into two expressions multiplied together. The goal is to identify potential solutions by recognizing that if the product of two factors is zero, at least one of the factors must be zero.``` Label 2: ```"Identifying": This step involves identifying the coefficients of the polynomial to be divided, which is a crucial step in setting up the synthetic division process. The reasoning here is focused on extracting and labeling the relevant information from the polynomial expression.```
   Answers:
-    [
-      {{
-      "pair_idx": 1,
-      "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 2,
-        "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 3,
-        "label": 'No'
-      }},
-      {{
-        "pair_idx": 4,
-        "label": 'No'
-      }}
-    ]
-  </example>
+    {{
+      "pairs": [
+        {{ "pair_idx": 1, "label": "Yes" }},
+        {{ "pair_idx": 2, "label": "Yes" }},
+        {{ "pair_idx": 3, "label": "No" }},
+        {{ "pair_idx": 4, "label": "No" }}
+      ]
+    }}
+</example>
 
   Now it's your turn:
   {samples_str}
@@ -69,10 +69,13 @@ I will show you {k_i} pairs of of labels, all applied to different emotions.
 
 Are the two labels in each pair describing related emotions with related impacts on the reader?
 Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
-Answer with "Yes" or "No". Answer each in a JSON in the format:
+Answer with "Yes" or "No".
+Return ONLY valid JSON in this exact format (use double quotes everywhere):
 {{
-  "pair_idx": PAIR_IDX,
-  "label": 'Yes' or 'No'
+  "pairs": [
+    {{ "pair_idx": 1, "label": "Yes" }},
+    {{ "pair_idx": 2, "label": "No" }}
+  ]
 }}
 
 <example>
@@ -81,24 +84,14 @@ Answer with "Yes" or "No". Answer each in a JSON in the format:
 3. Label 1: "Desire": The commenter expresses a strong craving or longing for the cake. Label 2: "Longing": Wishing for validation or recognition.
 4. Label 1: "Anger": The commenter expresses strong negative feelings towards the subject. Label 2: "Humor": The commenter uses humor to relate to the situation.
   Answers:
-    [
-      {{
-      "pair_idx": 1,
-      "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 2,
-        "label": 'No'
-      }},
-      {{
-        "pair_idx": 3,
-        "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 4,
-        "label": 'No'
-      }}
-    ]
+    {{
+      "pairs": [
+        {{ "pair_idx": 1, "label": "Yes" }},
+        {{ "pair_idx": 2, "label": "No" }},
+        {{ "pair_idx": 3, "label": "Yes" }},
+        {{ "pair_idx": 4, "label": "No" }}
+      ]
+    }}
 </example>
 Now it's your turn:
 {samples_str}
@@ -111,10 +104,13 @@ I will show you {k_i} pairs of of labels, all applied to different reactions to 
 
 Are the two labels in each pair describing similar reactions?
 Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
-Answer with "Yes" or "No". Answer each in a JSON in the format:
+Answer with "Yes" or "No".
+Return ONLY valid JSON in this exact format (use double quotes everywhere):
 {{
-  "pair_idx": PAIR_IDX,
-  "label": 'Yes' or 'No'
+  "pairs": [
+    {{ "pair_idx": 1, "label": "Yes" }},
+    {{ "pair_idx": 2, "label": "No" }}
+  ]
 }}
 
 <example>
@@ -123,24 +119,14 @@ Answer with "Yes" or "No". Answer each in a JSON in the format:
 3. Label 1: "Confrontational": Challenges the original comment\'s perspective directly. Label 2: "Hostile": Aggressively dismissing the original comment.
 4. Label 1: "Critical": Judging the actions of the individual in the scenario. Label 2: "Concerned": Expressing alarm about the situation.
   Answers:
-    [
-      {{
-      "pair_idx": 1,
-      "label": 'No'
-      }},
-      {{
-        "pair_idx": 2,
-        "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 3,
-        "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 4,
-        "label": 'No'
-      }}
-    ]
+    {{
+      "pairs": [
+        {{ "pair_idx": 1, "label": "No" }},
+        {{ "pair_idx": 2, "label": "Yes" }},
+        {{ "pair_idx": 3, "label": "Yes" }},
+        {{ "pair_idx": 4, "label": "No" }}
+      ]
+    }}
 </example>
 Now it's your turn:
 {samples_str}
@@ -153,10 +139,13 @@ I will show you {k_i} pairs of of labels, all applied to different sentences in 
 
 Are the two labels in each pair describing similar discourse purposes?
 Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
-Answer with "Yes" or "No". Answer each in a JSON in the format:
+Answer with "Yes" or "No".
+Return ONLY valid JSON in this exact format (use double quotes everywhere):
 {{
-  "pair_idx": PAIR_IDX,
-  "label": 'Yes' or 'No'
+  "pairs": [
+    {{ "pair_idx": 1, "label": "Yes" }},
+    {{ "pair_idx": 2, "label": "No" }}
+  ]
 }}
 
 <example>
@@ -165,24 +154,14 @@ Answer with "Yes" or "No". Answer each in a JSON in the format:
 3. Label 1: "Summary of Market Trends": Summarizes the overall performance of CBOT agricultural futures, linking it to weather and trade talks. Label 2: "Supply Forecast": This sentence discusses potential increases in non-OPEC oil supply, which is relevant to the overall market dynamics.
 4. Label 1: "Contextual Insight": Links rapid intensification of storms to climate change through scientific studies, highlighting its increasing seriousness. Label 2: "Human Interest": Provides a quote from an individual explaining their actions, emotions and experiences during the climate-change induced storm.
   Answers:
-    [
-      {{
-      "pair_idx": 1,
-      "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 2,
-        "label": 'No'
-      }},
-      {{
-        "pair_idx": 3,
-        "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 4,
-        "label": 'No'
-      }}
-    ]
+    {{
+      "pairs": [
+        {{ "pair_idx": 1, "label": "Yes" }},
+        {{ "pair_idx": 2, "label": "No" }},
+        {{ "pair_idx": 3, "label": "Yes" }},
+        {{ "pair_idx": 4, "label": "No" }}
+      ]
+    }}
 </example>
 Now it's your turn:
 {samples_str}
@@ -195,10 +174,13 @@ I will show you {k_i} pairs of of labels, all applied to different sentences in 
 
 Are the two labels in each pair describing similar argumentation strategies or are having similar effects on the reader?
 Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
-Answer with "Yes" or "No". Answer each in a JSON in the format:
+Answer with "Yes" or "No".
+Return ONLY valid JSON in this exact format (use double quotes everywhere):
 {{
-  "pair_idx": PAIR_IDX,
-  "label": 'Yes' or 'No'
+  "pairs": [
+    {{ "pair_idx": 1, "label": "Yes" }},
+    {{ "pair_idx": 2, "label": "No" }}
+  ]
 }}
 
 <example>
@@ -207,24 +189,14 @@ Answer with "Yes" or "No". Answer each in a JSON in the format:
 3. Label 1: "Statistical Evidence": The reference to the absence of convictions since 1969 serves as a powerful statistic that underscores the ongoing issue of police impunity, reinforcing the argument for the need for reform. Label 2: "Trend Evidence": Similar to the previous sentence, this presents another trend in gun ownership, specifically regarding background checks, reinforcing the argument that more people are seeking to legally own guns.
 4. Label 1: "Minimization": The author downplays the severity of the actions of the Paris assassins, framing them as ordinary individuals rather than terrorists, which serves to diminish the perceived threat. Label 2: "Critique": Critically points out the limited nature of the official\'s engagement, suggesting a lack of genuine dialogue beyond a narrow focus on counter-terrorism.
   Answers:
-    [
-      {{
-      "pair_idx": 1,
-      "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 2,
-        "label": 'No'
-      }},
-      {{
-        "pair_idx": 3,
-        "label": 'Yes'
-      }},
-      {{
-        "pair_idx": 4,
-        "label": 'No'
-      }}
-    ]
+    {{
+      "pairs": [
+        {{ "pair_idx": 1, "label": "Yes" }},
+        {{ "pair_idx": 2, "label": "No" }},
+        {{ "pair_idx": 3, "label": "Yes" }},
+        {{ "pair_idx": 4, "label": "No" }}
+      ]
+    }}
 </example>
 Now it's your turn:
 {samples_str}
@@ -232,6 +204,36 @@ Now it's your turn:
 Answers:
 """
 
+BIOGRAPHIES_SIMILARITY_PROMPT = """
+I will show you {k_i} pairs of labels, all applied to different sentences in biographical articles.
+
+Are the two labels in each pair describing similar biographical roles or functions?
+Think broadly about what each label is describing. Don't pay attention to the specific topic or subject matter of each label.
+Answer with "Yes" or "No".
+Return ONLY valid JSON in this exact format (use double quotes everywhere):
+{{
+  "pairs": [
+    {{ "pair_idx": 1, "label": "Yes" }},
+    {{ "pair_idx": 2, "label": "No" }}
+  ]
+}}
+
+<example>
+1. Label 1: "Early Life" - describes childhood or family background. Label 2: "Childhood Context" - provides early background details.
+2. Label 1: "Career Milestone" - describes a notable professional achievement. Label 2: "Personal Life" - describes relationships or family matters.
+Answers:
+  {{
+    "pairs": [
+      {{ "pair_idx": 1, "label": "Yes" }},
+      {{ "pair_idx": 2, "label": "No" }}
+    ]
+  }}
+</example>
+Now it's your turn:
+{samples_str}
+
+Answers:
+"""
 
 ########################
 #
@@ -263,6 +265,31 @@ EDITORIAL_INITIAL_LABELING_PROMPT = """
   Your response:
 """
 
+BIOGRAPHIES_INITIAL_LABELING_PROMPT = """
+  You will be given a biographical article excerpt as well as a sentence from that article.
+
+  For each sentence, give a concise, generic label describing its role in a biography narrative or structure.
+  Focus on the sentence's function (e.g., early life context, education, career milestone, contributions, personal life, legacy, or section header),
+  not the surface topic. Avoid summarizing the content.
+  Return a JSON in the format:
+
+  {{
+    "label": LABEL,
+    "description": DESCRIPTION
+  }}
+
+  If the line is a section header, list marker, or metadata, label it as "Section Header" or "Metadata".
+
+  <article>
+  {article}
+  </article>
+
+  <sentence>
+  {sentence}
+  </sentence>
+
+  Your response:
+"""
 
 MULTI_SENTENCE_EDITORIAL_LABELING_PROMPT = """
 You will be given an editorial or opinion article as well as {k} sentences from that article. 
@@ -427,13 +454,13 @@ class SimilarityResponse(BaseModel):
     """Response format for similarity task."""
     pair_idx: int
     label: Literal['Yes', 'No']
-    description: str
+    description: Optional[str] = None
 
 
 class MultiSimilarityResponse(BaseModel):
     """Response format for multi-sentence similarity labeling."""
     pairs: List[SimilarityResponse]
-    descriptions: str
+    descriptions: Optional[str] = None
 
 
 HATE_SPEECH_LABELING_PROMPT = """

@@ -37,6 +37,7 @@ from prompts import (
     MULTI_SENTENCE_EDITORIAL_LABELING_PROMPT,
     EditorialLabelingResponse,
     MultiSentenceLabelingResponse,
+    BIOGRAPHIES_INITIAL_LABELING_PROMPT,
     # 
     SINGLE_COMMENT_EMOTION_LABELING_PROMPT,
     MULTI_SENTENCE_EMOTION_LABELING_PROMPT,
@@ -166,8 +167,42 @@ def make_labeling_prompts_editorials(input_df, multi_sentence=False, num_sents_p
             ), axis=1)
         )
         prompt_df['response_format'] = MultiSentenceLabelingResponse
-        return prompt_df
+    return prompt_df
     
+
+def make_labeling_prompts_biographies(input_df, multi_sentence=False, num_sents_per_prompt=8, window_size=3):
+    # Reuse editorial windowing; only prompt template changes.
+    if not multi_sentence:
+        all_responses = []
+        g = input_df.groupby('doc_index')
+        for doc_index, df in g:
+            df = df[['sent_index', 'sentence_text']].sort_values('sent_index')
+            sent_texts = df['sentence_text'].tolist()
+            sent_indices = df['sent_index'].tolist()
+            for pos, (sent_index, sentence_text) in enumerate(zip(sent_indices, sent_texts)):
+                start = max(0, pos - window_size)
+                end = min(len(sent_texts), pos + window_size + 1)
+                doc_text = ' '.join(sent_texts[start:end])
+                all_responses.append({
+                    'index': f'{doc_index.replace("/", "_")}__sent_index-{sent_index}',
+                    'doc_text': doc_text,
+                    'sent_text': sentence_text,
+                })
+
+        prompt_df = pd.DataFrame(all_responses)
+        prompt_df['prompt'] = (
+            prompt_df.apply(lambda r: BIOGRAPHIES_INITIAL_LABELING_PROMPT.format(article=r['doc_text'], sentence=r['sent_text']), axis=1)
+        )
+        prompt_df['response_format'] = EditorialLabelingResponse
+        return prompt_df
+    else:
+        # Multi-sentence biographies not customized yet; fallback to editorial multi-sentence prompt.
+        return make_labeling_prompts_editorials(
+            input_df=input_df,
+            multi_sentence=True,
+            num_sents_per_prompt=num_sents_per_prompt,
+            window_size=window_size,
+        )
 
 def make_labeling_prompts_emotions(input_df, multi_sentence=False, num_sents_per_prompt=8):
     if not multi_sentence:
@@ -278,17 +313,32 @@ def make_labeling_prompts_hate_speech(input_df, multi_sentence=False, num_sents_
         return prompt_df
 
 
-def process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=None):
+def _truncate_text(text, max_len=500):
+    if text is None:
+        return None
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
+
+
+def process_batch_vllm(model, tokenizer, prompts_to_run, response_format, guided_decoding_cls=None):
     """Process a batch of prompts using VLLM."""
     logging.info(f'sample prompt: {prompts_to_run["prompt"].tolist()[0]}')
     json_schema = response_format.model_json_schema()
     if guided_decoding_cls is not None:
-        guided_decoding_params = guided_decoding_cls(response_format=json_schema)
+        guided_decoding_params = guided_decoding_cls(json=json_schema)
         sampling_params = SamplingParams(temperature=0.1, max_tokens=1024, guided_decoding=guided_decoding_params)
     else:
         sampling_params = SamplingParams(temperature=0.1, max_tokens=1024)
 
-    outputs = model.generate(prompts_to_run['prompt'].tolist(), sampling_params)
+    prompt_dicts = list(map(lambda x: [
+        { "role": "user", "content": x, },
+    ], prompts_to_run['prompt'].tolist()))
+    formatted_prompts = list(map(lambda x:
+        tokenizer.apply_chat_template(x, tokenize=False, add_generation_prompt=True), prompt_dicts
+    ))
+    outputs = model.generate(formatted_prompts, sampling_params)
     inputted_prompts = list(map(lambda x: x.prompt, outputs))
     model_outputs = list(map(lambda x: x.outputs[0].text, outputs))
     return inputted_prompts, model_outputs, outputs
@@ -327,8 +377,8 @@ def process_all_openai(
     return output_df
 
 def postprocess_outputs(output_df, experiment, num_sents_per_prompt):
-    content_column = 'sentences' if experiment in ['editorials', 'news-discourse'] else 'comments'
-    content_id_column = 'sentence_idx' if experiment in ['editorials', 'news-discourse'] else 'comment_idx'
+    content_column = 'sentences' if experiment in ['editorials', 'news-discourse', 'biographies'] else 'comments'
+    content_id_column = 'sentence_idx' if experiment in ['editorials', 'news-discourse', 'biographies'] else 'comment_idx'
 
     if output_df['response'].isna().sum() > 0:
         logging.warning(f'{output_df["response"].isna().sum()} responses are missing')
@@ -387,6 +437,8 @@ if __name__ == "__main__":
         # Convert response_format back to the appropriate class
         if args.experiment == 'editorials':
             prompts['response_format'] = MultiSentenceLabelingResponse if args.num_sents_per_prompt > 1 else EditorialLabelingResponse
+        elif args.experiment == 'biographies':
+            prompts['response_format'] = MultiSentenceLabelingResponse if args.num_sents_per_prompt > 1 else EditorialLabelingResponse
         elif args.experiment == 'emotions':
             prompts['response_format'] = MultiCommentLabelingResponse if args.num_sents_per_prompt > 1 else SingleCommentLabelingResponse
         elif args.experiment == 'hate-speech':
@@ -396,6 +448,13 @@ if __name__ == "__main__":
     else:
         if args.experiment == 'editorials':
             prompts = make_labeling_prompts_editorials(
+                input_df=input_df,
+                multi_sentence=args.num_sents_per_prompt > 1,
+                num_sents_per_prompt=args.num_sents_per_prompt,
+                window_size=args.window_size,
+            )
+        elif args.experiment == 'biographies':
+            prompts = make_labeling_prompts_biographies(
                 input_df=input_df,
                 multi_sentence=args.num_sents_per_prompt > 1,
                 num_sents_per_prompt=args.num_sents_per_prompt,
@@ -488,7 +547,25 @@ if __name__ == "__main__":
                 # create an empty file to indicate that this batch is being processed
                 with open(output_fname, 'w') as f:
                     f.write('')
-                inputted_prompts, model_outputs, outputs = process_batch_vllm(model, prompts_to_run, response_format, guided_decoding_cls=GuidedDecodingParams)
+                inputted_prompts, model_outputs, outputs = process_batch_vllm(
+                    model,
+                    tokenizer,
+                    prompts_to_run,
+                    response_format,
+                    guided_decoding_cls=GuidedDecodingParams,
+                )
+                # Log parseability to debug empty/invalid responses.
+                parsed_outputs = [robust_parse_outputs(o) for o in model_outputs]
+                num_invalid = sum(p is None for p in parsed_outputs)
+                if num_invalid > 0:
+                    logging.warning(
+                        f"Batch {start_idx}-{end_idx}: {num_invalid}/{len(model_outputs)} responses failed parsing"
+                    )
+                    # Log a few raw samples to inspect formatting.
+                    for i, raw in enumerate(model_outputs[:3]):
+                        logging.warning(f"raw_output_sample_{i}: {_truncate_text(raw)}")
+                else:
+                    logging.info(f"Batch {start_idx}-{end_idx}: all responses parsed successfully")
                 write_to_file(
                     output_fname,
                     indices=prompts_to_run['index'].tolist(),

@@ -1157,13 +1157,17 @@ def main():
     print(f"Using output directory: {output_dir}")
 
     # Load examples dataframe if provided
-    examples_df, text_embeddings = custom_examples_loader(
+    examples_result = custom_examples_loader(
         data_level_labels_path=args.datapoint_level_labels_path,
         examples_dataframe_path=args.raw_data_examples_df_path,
         initial_labels_embeddings_path=args.initial_datapoint_level_label_embeddings,
         use_discretization=args.use_discretization,
         experiment=args.experiment
     )
+    if examples_result is None:
+        examples_df, text_embeddings = None, None
+    else:
+        examples_df, text_embeddings = examples_result
 
     # Run hierarchical clustering
     result = run_hierarchical_clustering(

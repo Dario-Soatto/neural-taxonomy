@@ -59,21 +59,34 @@ def _get_examples_for_one_node(
     example_df: pd.DataFrame,
     sentence_col: str = 'sentence',
     num_examples_per_node: int = 10,
-    tree: nx.DiGraph = None
+    tree: nx.DiGraph = None,
+    cluster_col: str = 'cluster'
 ):
     """
     Get examples for a single node.
     """
     orig_leaf_node_id = tree.nodes[node].get('orig_leaf_node_id')
-    if orig_leaf_node_id is not None:
+    if orig_leaf_node_id is None:
+        return []
+    node_examples = None
+    # Prefer index lookup if the DataFrame is indexed by cluster id.
+    if orig_leaf_node_id in example_df.index:
         node_examples = example_df.loc[orig_leaf_node_id][sentence_col]
-        if isinstance(node_examples, pd.Series):
-            if len(node_examples) > num_examples_per_node:
-                node_examples = node_examples.sample(num_examples_per_node).tolist()
-            else:
-                node_examples = node_examples.tolist()
+    # Fallback: use the cluster column if present.
+    elif cluster_col in example_df.columns:
+        node_examples = example_df.loc[example_df[cluster_col] == orig_leaf_node_id, sentence_col]
+    else:
+        return []
+
+    if isinstance(node_examples, pd.Series):
+        if len(node_examples) == 0:
+            return []
+        if len(node_examples) > num_examples_per_node:
+            node_examples = node_examples.sample(num_examples_per_node).tolist()
         else:
-            node_examples = [node_examples]
+            node_examples = node_examples.tolist()
+    else:
+        node_examples = [node_examples] if node_examples is not None else []
     return node_examples
 
 
@@ -109,12 +122,26 @@ def single_pass_summarize_labels_with_examples(
     """
         Summarize a label with examples.
     """
-    sample_nodes, sample_labels = _get_sample_nodes(node, tree, num_samples_to_label, sentence_col)
+    sample_result = _get_sample_nodes(node, tree, num_samples_to_label, sentence_col)
+    if sample_result is None:
+        print(f"Warning: No labeled descendants available for node {node}. Using fallback label.")
+        return TreeNodeLabelResponse(
+            label=f"Node {node} - No Samples",
+            description="Label generated without labeled descendants."
+        )
+    sample_nodes, sample_labels = sample_result
 
     # Collect examples for the sample nodes if available
     examples = []
     for sample_node_i in sample_nodes:
-        examples.extend(_get_examples_for_one_node(sample_node_i, example_df, sentence_col, num_examples_per_node, tree))
+        examples.extend(_get_examples_for_one_node(
+            sample_node_i,
+            example_df,
+            sentence_col,
+            num_examples_per_node,
+            tree,
+            cluster_col='cluster'
+        ))
         node_label = tree.nodes[sample_node_i].get('label', 'Unknown')
         examples.append(f"Label: {node_label}")
         examples.append("")  # Add a separator

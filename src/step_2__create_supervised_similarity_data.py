@@ -1,3 +1,23 @@
+
+def _parse_similarity_pairs(raw_text):
+    if raw_text is None:
+        return None
+    
+    # REGEX: Extract pairs ignoring JSON syntax completely
+    # Matches keys/values with single OR double quotes
+    pairs = []
+    # Looks for pair_idx: <num> ... label: <Yes/No>
+    pattern = r"""pair_idx["']?\s*:\s*(\d+).*?label["']?\s*:\s*["']?([Yy]es|[Nn]o)["']?"""
+
+    import re
+    for match in re.finditer(pattern, raw_text, re.DOTALL | re.IGNORECASE):
+        pairs.append({
+            "pair_idx": int(match.group(1)),
+            "label": match.group(2).capitalize()
+        })
+        
+    return pairs if pairs else None
+
 #!/usr/bin/env python
 # coding: utf-8
 
@@ -43,6 +63,7 @@ import torch
 import logging
 import itertools
 from utils_openai_client import generate_responses, load_model
+from utils_vllm_client import robust_parse_outputs
 from prompts import (
     MultiSimilarityResponse, 
     EMOTIONS_SIMILARITY_PROMPT, 
@@ -51,6 +72,7 @@ from prompts import (
     EDITORIAL_SIMILARITY_PROMPT,
     HATE_SPEECH_SIMILARITY_PROMPT,
     GENERIC_SIMILARITY_PROMPT,
+    BIOGRAPHIES_SIMILARITY_PROMPT,
 )
 
 # Set environment variable
@@ -322,7 +344,51 @@ def create_triplets(full_data_exp_df, max_negatives_per_positive=10, max_positiv
     return triplets
 
 
-def match_batched_vllm_results_to_prompts(all_results, all_batched_inputs):
+def _parse_similarity_pairs(raw_text):
+    """
+    Robustly parses similarity pairs from text, handling both:
+    1. Valid JSON: [{"pair_idx": 1, "label": "Yes"}]
+    2. Python-style Dicts (what your model is outputting): { 'pair_idx': 1, 'label': 'Yes' }
+    """
+    if raw_text is None:
+        return None
+
+    # Strategy 1: Regex Extraction (Most Robust)
+    # This ignores strict JSON syntax and just grabs the pairs and labels
+    pairs = []
+    # Matches: pair_idx followed by a number, then label followed by 'Yes' or 'No' (case insensitive)
+    # Handles both 'Yes' and "Yes"
+    pattern = r"""pair_idx["']?\s*:\s*(\d+).*?label["']?\s*:\s*["']?([Yy]es|[Nn]o)["']?"""
+    
+    for match in re.finditer(pattern, raw_text, re.DOTALL | re.IGNORECASE):
+        pairs.append({
+            "pair_idx": int(match.group(1)),
+            "label": match.group(2).capitalize() # Normalizes 'yes' -> 'Yes'
+        })
+    
+    if pairs:
+        return pairs
+
+    # Strategy 2: Fix Quotes and Parse as JSON
+    try:
+        # Swap single quotes for double quotes
+        text_fixed = raw_text.replace("'", '"')
+        # Add brackets if missing
+        if not text_fixed.strip().startswith('['):
+            text_fixed = f"[{text_fixed}]"
+        
+        parsed = robust_parse_outputs(text_fixed)
+        if isinstance(parsed, dict) and 'pairs' in parsed:
+            return parsed['pairs']
+        if isinstance(parsed, list):
+            return parsed
+    except:
+        pass
+
+    return None
+
+
+def match_batched_vllm_results_to_prompts(all_results, all_batched_inputs, raw_log_path=None):
     """
     Match prompts to VLLM results when each prompt is a batch of multiple queries.
     """
@@ -330,15 +396,44 @@ def match_batched_vllm_results_to_prompts(all_results, all_batched_inputs):
     logging.info(f"Number of results: {len(all_results)}")
     logging.info(f"Number of batched inputs: {len(all_batched_inputs)}")
     
+    raw_logged = 0
     for i, (r, b) in enumerate(zip(all_results, all_batched_inputs)):
         try:
-            # Parse the JSON response
-            parsed_result = json.loads(r)
+            if r is None:
+                logging.warning(f"Batch {i}: Empty result (None)")
+                continue
+
+            pairs = None
+            raw_text = None
+
+            # --- BUG FIX START ---
+            # Case 1: Result is already a successful Dictionary (from Structured Decoding)
+            if isinstance(r, dict) and "pairs" in r:
+                pairs = r["pairs"]
+                
+            # Case 2: Result is a Dictionary but failed parsing (contains _raw)
+            elif isinstance(r, dict) and "_raw" in r:
+                raw_text = r["_raw"]
+                pairs = _parse_similarity_pairs_final(raw_text)
+
+            # Case 3: Result is a Raw String (Standard Decoding)
+            elif isinstance(r, str):
+                raw_text = r
+                pairs = _parse_similarity_pairs_final(raw_text)
+            # --- BUG FIX END ---
+
             
             # Extract the labels from the pairs
-            if isinstance(parsed_result, dict) and 'pairs' in parsed_result:
-                sorted_pairs = sorted(parsed_result['pairs'], key=lambda x: x['pair_idx'])
-                labels = [pair['label'] for pair in sorted_pairs]
+            if pairs is not None:
+                # Ensure it's a list (sometimes parser returns a dict if the model output was weird)
+                if isinstance(pairs, dict):
+                    # Edge case where model output nested dicts strangely
+                    pairs = pairs.get('pairs', pairs) 
+                
+                # Normalize keys (handle 'pair_idx' vs 'pair_index' etc if needed, but usually strictly enforced)
+                sorted_pairs = sorted(pairs, key=lambda x: int(x.get('pair_idx', 0)))
+                labels = [pair.get('label') for pair in sorted_pairs]
+                
                 if len(labels) == len(b):
                     # Create a copy of the DataFrame to avoid the SettingWithCopyWarning
                     b_copy = b.copy()
@@ -346,18 +441,23 @@ def match_batched_vllm_results_to_prompts(all_results, all_batched_inputs):
                     all_merged.append(b_copy)
                 else:
                     logging.warning(f"Batch {i}: JSON pairs length mismatch - result: {len(labels)}, input: {len(b)}")
-                    logging.warning(f"First few result items: {labels[:3]}")
-                    logging.warning(f"First few input items: {b.head(3) if hasattr(b, 'head') else b[:3]}")
+                    if raw_text: logging.warning(f"Raw text start: {raw_text[:100]}...")
             else:
-                logging.warning(f"Batch {i}: Expected JSON with 'pairs' key but got {type(parsed_result)}")
-                logging.warning(f"Result content: {r[:200]}...")
-        except json.JSONDecodeError as e:
-            logging.error(f"Batch {i}: Failed to parse JSON response: {str(e)}")
-            logging.error(f"Raw response: {r[:200]}...")
+                logging.warning(f"Batch {i}: Failed to parse similarity pairs")
+                if raw_text:
+                    logging.warning(f"Result content: {raw_text[:200]}...")
+                    if raw_log_path and raw_logged < 5:
+                        with open(raw_log_path, "a") as f:
+                            f.write(f"batch {i} raw:\n{raw_text}\n\n")
+                        raw_logged += 1
+        except Exception as e:
+            logging.error(f"Batch {i}: Unexpected error: {str(e)}")
+            if isinstance(r, dict) and "_raw" in r:
+                logging.error(f"Raw response: {r['_raw'][:200]}...")
 
     if not all_merged:
         logging.error("No batches were successfully matched!")
-        return pd.DataFrame()  # Return empty DataFrame instead of raising error
+        return pd.DataFrame()
         
     full_data_df = pd.concat(all_merged)
     return full_data_df
@@ -383,13 +483,24 @@ def match_batched_openai_results_to_prompts(all_results, all_batched_inputs):
     return full_data_df
 
 
+def _load_single_input(path):
+    if path.endswith('.csv'):
+        return pd.read_csv(path)
+    if path.endswith('.json') or path.endswith('.jsonl'):
+        return pd.read_json(path, lines=True)
+    raise ValueError(f"Unsupported file type: {path}")
+
+
 def load_and_preprocess(input_file, text_col_name, text_col_name_2, debug=False):
-    if '.csv' in input_file:
-        input_df = pd.read_csv(input_file)
-    elif '.json' in input_file:
-        input_df = pd.read_json(input_file, lines=True)
+    # Allow glob patterns so Step 2 can consume Step 1 shards directly.
+    if any(ch in input_file for ch in ['*', '?', '[']):
+        input_paths = sorted(glob.glob(input_file))
+        if not input_paths:
+            raise FileNotFoundError(f"No input files matched glob: {input_file}")
+        logging.info(f"Merging {len(input_paths)} input shards")
+        input_df = pd.concat([_load_single_input(p) for p in input_paths], ignore_index=True)
     else:
-        raise ValueError(f"Unsupported file type: {input_file}")
+        input_df = _load_single_input(input_file)
     
     if debug:
         logging.info("Running in debug mode - limiting to 10,000 rows")
@@ -453,6 +564,8 @@ def get_prompt_template(prompt_template):
         return NEWS_DISCOURSE_SIMILARITY_PROMPT
     elif prompt_template == 'editorial':
         return EDITORIAL_SIMILARITY_PROMPT
+    elif prompt_template == 'biographies':
+        return BIOGRAPHIES_SIMILARITY_PROMPT
     elif prompt_template == 'hate_speech':
         return HATE_SPEECH_SIMILARITY_PROMPT
     
@@ -562,7 +675,14 @@ def main():
             response_format=MultiSimilarityResponse,
         )
         logging.info("Matching VLLM results to prompts")
-        full_data_exp_df = match_batched_vllm_results_to_prompts(results, all_batched_inputs)
+        raw_log_path = None
+        if args.temp_dir:
+            raw_log_path = os.path.join(args.temp_dir, "step2_vllm_raw_samples.txt")
+        full_data_exp_df = match_batched_vllm_results_to_prompts(
+            results,
+            all_batched_inputs,
+            raw_log_path=raw_log_path,
+        )
 
     if args.debug:
         logging.info("Writing debug results to file")
@@ -582,6 +702,9 @@ def main():
 
     # Step 3: Create triplets and save to file
     # ----------------------------------------------------------------
+    if full_data_exp_df.empty or 'label' not in full_data_exp_df.columns:
+        logging.error("No labeled pairs available; skipping triplet creation.")
+        return
     logging.info("Creating triplets from labeled data")
     triplets = create_triplets(full_data_exp_df)
     output_filename = f'triplets_{output_fname}.jsonl'
@@ -591,6 +714,74 @@ def main():
         f.write_all(triplets)
         
     logging.info("Processing complete")
+
+def _parse_similarity_pairs_regex_v3(raw_text):
+    if raw_text is None:
+        return None
+    
+    pairs = []
+    
+    # NEW: Extremely simple regex. 
+    # Just looks for "pair_idx": <number> and "label": <Yes/No> anywhere near each other.
+    # It handles newlines, spaces, quotes (single/double/none), and case sensitivity.
+    
+    # Pattern explanation:
+    # pair_idx  -> match literal "pair_idx"
+    # [^0-9]* -> match any non-number chars (quotes, colons, spaces)
+    # (\d+)     -> CAPTURE the number
+    # .*?       -> match anything in between (non-greedy)
+    # label     -> match literal "label"
+    # [^a-zA-Z]* -> match non-letters (quotes, colons, spaces)
+    # ([Yy]es|[Nn]o) -> CAPTURE Yes/No
+    
+    pattern = r'pair_idx[^0-9]*(\d+).*?label[^a-zA-Z]*([Yy]es|[Nn]o)'
+    
+    import re
+    # re.DOTALL is crucial so .*? matches across newlines
+    matches = list(re.finditer(pattern, raw_text, re.DOTALL | re.IGNORECASE))
+    
+    for match in matches:
+        pairs.append({
+            "pair_idx": int(match.group(1)),
+            "label": match.group(2).capitalize()
+        })
+        
+    if not pairs:
+        # LOGGING: Print the failed raw text to logs so we can see it!
+        print(f"\n[DEBUG] Parsing failed for output:\n{'-'*20}\n{raw_text}\n{'-'*20}\n", file=sys.stderr)
+        
+    return pairs if pairs else None
+
+
+def _parse_similarity_pairs_final(raw_text):
+    import sys
+    import re
+    
+    # 1. LOGGING: Print the start of the text to stderr so it shows in SLURM logs
+    if raw_text and len(raw_text.strip()) > 0:
+        safe_preview = raw_text.replace('\n', '\\n')[:100]
+        print(f"[DEBUG] Parsing Input: {safe_preview}...", file=sys.stderr)
+    else:
+        print(f"[DEBUG] CRITICAL: Input raw_text is None or Empty!", file=sys.stderr)
+        return None
+
+    pairs = []
+    
+    # 2. YOUR REGEX: Triple quoted to handle single quotes safely
+    pattern = r"""pair_idx["']?\s*:\s*(\d+).*?label["']?\s*:\s*["']?([Yy]es|[Nn]o)["']?"""
+    print(f"[DEBUG]: Using regex {pattern}")
+
+    for match in re.finditer(pattern, raw_text, re.DOTALL | re.IGNORECASE):
+        pairs.append({
+            "pair_idx": int(match.group(1)),
+            "label": match.group(2).capitalize()
+        })
+        
+    if not pairs:
+        print(f"\n[DEBUG] Regex matched nothing. Dumping Raw Text:\n{'-'*20}\n{raw_text}\n{'-'*20}\n", file=sys.stderr)
+        
+    return pairs if pairs else None
+
 
 if __name__ == "__main__":
     main()
