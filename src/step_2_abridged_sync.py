@@ -3,7 +3,12 @@
 
 # ----------------------------------------------------------------
 """ 
-This script processes narrative function data to generate prompts for VLLM and/or theOpenAI API.
+Step 2: Create Supervised Similarity Data
+SYNCHRONOUS API VERSION - uses direct API calls instead of batch API.
+Faster and more reliable than batch API when batches are stuck.
+Uses concurrent requests for speed.
+
+This script processes narrative function data to generate prompts for OpenAI API.
 
 Command line arguments:
 - input_file: Path to the input CSV file with the following columns:
@@ -12,15 +17,14 @@ Command line arguments:
 - output_file: Path to the output file where the processed data will be saved.
 - text_col_name: Name of the column containing the text data (default: 'Narrative Function').
 - text_keyword_name: Keyword to use in the prompt (default: 'Description').
-- err_col_name: Name of the column indicating errors (default: 'Is_Error').
 - embedding_model_name: Name of the SentenceTransformer model to use for computing embeddings.
-- use_openai: Use OpenAI instead of VLLM.
 - model_name: Name of the LLM to use for prompting.
-- batch_size: Size of the batches for processing (default: 32).
-- max_returned: Maximum number of rows to return (optional).
+- concurrency: Number of concurrent API requests (default: 50).
+- checkpoint_every: Save checkpoint every N responses (default: 100).
 
 Output:
-- A JSONL file containing the processed data with computed embeddings.
+- A CSV file containing paired labeled data.
+- A JSONL file containing triplets for training.
 """
 
 import os
@@ -34,6 +38,7 @@ import jsonlines
 from tqdm.auto import tqdm
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.metrics.pairwise import cosine_similarity as sk_cosine_similarity
 from torch.nn.functional import cosine_similarity as torch_cosine_similarity
 from sentence_transformers import SentenceTransformer
@@ -43,9 +48,6 @@ sys.path.append('..')
 import torch
 import logging
 import itertools
-# Don't import generate_responses - we use our own rate-limited version below
-from utils_openai_client import load_model
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from prompts import (
     MultiSimilarityResponse, 
     EMOTIONS_SIMILARITY_PROMPT, 
@@ -74,172 +76,205 @@ os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
 
 
 # ============================================================================
-# RATE-LIMITED OPENAI BATCH API (replaces utils_openai_client.generate_responses)
+# CHECKPOINTING FUNCTIONS (for sync mode)
 # ============================================================================
 
-def generate_responses(
+def get_checkpoint_paths(output_file, temp_dir):
+    """Get paths for checkpoint files."""
+    base = os.path.splitext(output_file)[0]
+    checkpoint_dir = temp_dir or os.path.dirname(output_file) or '.'
+    return {
+        'results': f"{base}_partial_results.jsonl",
+        'state': os.path.join(checkpoint_dir, f"{os.path.basename(base)}_sync_state.json"),
+    }
+
+
+def save_all_results(checkpoint_paths, all_responses):
+    """Save ALL results to disk (overwrites previous checkpoint)."""
+    with open(checkpoint_paths['results'], 'w') as f:
+        for resp in all_responses:
+            f.write(json.dumps(resp) + '\n')
+
+
+def save_checkpoint_state(checkpoint_paths, completed_ids):
+    """Save the set of completed prompt IDs."""
+    with open(checkpoint_paths['state'], 'w') as f:
+        json.dump({'completed_ids': list(completed_ids)}, f)
+
+
+def save_checkpoint(checkpoint_paths, all_responses, completed_ids):
+    """Save full checkpoint: all responses + all completed IDs."""
+    save_all_results(checkpoint_paths, all_responses)
+    save_checkpoint_state(checkpoint_paths, completed_ids)
+    logging.info(f"[Checkpoint] 💾 Saved {len(all_responses)} responses")
+
+
+def load_checkpoint_state(checkpoint_paths):
+    """Load existing checkpoint state or create new."""
+    if os.path.exists(checkpoint_paths['state']):
+        with open(checkpoint_paths['state'], 'r') as f:
+            data = json.load(f)
+            return set(data.get('completed_ids', []))
+    return set()
+
+
+def load_partial_results(checkpoint_paths):
+    """Load any existing partial results."""
+    results = []
+    if os.path.exists(checkpoint_paths['results']):
+        with open(checkpoint_paths['results'], 'r') as f:
+            for line in f:
+                if line.strip():
+                    results.append(json.loads(line))
+        logging.info(f"[Checkpoint] 📂 Loaded {len(results)} existing responses from checkpoint")
+    return results
+
+
+def cleanup_checkpoint_files(checkpoint_paths):
+    """Remove checkpoint files after successful completion."""
+    for name, path in checkpoint_paths.items():
+        if os.path.exists(path):
+            os.remove(path)
+            logging.info(f"[Cleanup] Removed checkpoint file: {path}")
+
+
+# ============================================================================
+# SYNCHRONOUS OPENAI API (replaces batch API)
+# ============================================================================
+
+def make_single_request(client, prompt_id, prompt_text, model_name, response_format):
+    """Make a single synchronous API request with retry logic."""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.beta.chat.completions.parse(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt_text}],
+                response_format=response_format,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            
+            # Extract the parsed response
+            parsed = response.choices[0].message.parsed
+            if parsed:
+                return {
+                    'custom_id': prompt_id,
+                    'response': parsed.model_dump(),
+                }
+            else:
+                # Fallback to raw content if parsing failed
+                content = response.choices[0].message.content
+                return {
+                    'custom_id': prompt_id,
+                    'response': json.loads(content) if content else None,
+                }
+                
+        except Exception as e:
+            if "rate" in str(e).lower() and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5
+                time.sleep(wait_time)
+            elif attempt == max_retries - 1:
+                logging.warning(f"[Sync] Failed after {max_retries} attempts for {prompt_id}: {e}")
+                return {
+                    'custom_id': prompt_id,
+                    'response': None,
+                    'error': str(e),
+                }
+            else:
+                time.sleep(1)
+    
+    return {'custom_id': prompt_id, 'response': None, 'error': 'Unknown error'}
+
+
+def generate_responses_sync(
     prompt_ids,
     prompts,
     model_name,
-    temperature=0.1,
-    max_tokens=1024,
-    batch_size=5000,
-    debug_mode=False,
-    temp_dir=None,
-    batch_type="default",
     response_format=None,
-    max_concurrent_batches=2,
+    temp_dir=None,
+    output_file=None,
+    concurrency=50,
+    checkpoint_every=100,
 ):
     """
-    Generate responses using OpenAI's batch API with rate limiting.
-    Only launches max_concurrent_batches at a time to avoid hitting token limits.
+    Generate responses using synchronous OpenAI API with concurrent requests.
+    Much faster than batch API when batches are stuck.
     """
     from openai import OpenAI
-    from openai.lib._parsing._completions import type_to_response_format_param
     
-    logging.info("[OpenAI] Initializing client...")
+    logging.info("[Sync] Initializing OpenAI client...")
     client = OpenAI()
     
     if temp_dir is None:
         temp_dir = os.path.join(os.getcwd(), 'temp_batches')
     os.makedirs(temp_dir, exist_ok=True)
     
-    # Split into batches
-    batches_info = []
-    for i in range(0, len(prompts), batch_size):
-        end = min(i + batch_size, len(prompts))
-        batches_info.append({
-            'start': i,
-            'end': end,
-            'prompt_ids': prompt_ids[i:end],
-            'prompts': prompts[i:end],
-            'status': 'pending',
-            'openai_batch_id': None,
-        })
-    
-    logging.info(f"[OpenAI] Split into {len(batches_info)} batches of ~{batch_size} prompts each")
-    logging.info(f"[OpenAI] Will run max {max_concurrent_batches} concurrent batches to avoid rate limits")
-    
+    # Setup checkpointing
+    checkpoint_paths = get_checkpoint_paths(output_file, temp_dir) if output_file else None
+    completed_ids = set()
     all_responses = []
     
-    while any(b['status'] in ['pending', 'running'] for b in batches_info):
-        running = [b for b in batches_info if b['status'] == 'running']
-        pending = [b for b in batches_info if b['status'] == 'pending']
-        
-        # Launch new batches if we have room
-        while len(running) < max_concurrent_batches and pending:
-            batch = pending[0]
-            logging.info(f"[OpenAI] Launching batch {batch['start']}-{batch['end']}...")
-            
-            try:
-                # Create batch file
-                batch_requests = []
-                format_json = type_to_response_format_param(response_format) if response_format else None
-                
-                for pid, prompt in zip(batch['prompt_ids'], batch['prompts']):
-                    request_body = {
-                        "model": model_name,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                    }
-                    if format_json:
-                        request_body["response_format"] = format_json
-                    
-                    batch_requests.append({
-                        "custom_id": str(pid),
-                        "method": "POST",
-                        "url": "/v1/chat/completions",
-                        "body": request_body
-                    })
-                
-                # Write to file
-                batch_file_path = os.path.join(temp_dir, f'{batch_type}_batch_{batch["start"]}_{batch["end"]}.jsonl')
-                with jsonlines.open(batch_file_path, 'w') as f:
-                    f.write_all(batch_requests)
-                
-                # Upload and create batch
-                with open(batch_file_path, "rb") as batch_file_handle:
-                    batch_file = client.files.create(file=batch_file_handle, purpose="batch")
-                
-                openai_batch = client.batches.create(
-                    input_file_id=batch_file.id,
-                    endpoint="/v1/chat/completions",
-                    completion_window="24h"
-                )
-                
-                batch['openai_batch_id'] = openai_batch.id
-                batch['status'] = 'running'
-                running.append(batch)
-                pending.remove(batch)
-                
-                logging.info(f"[OpenAI] ✅ Batch {batch['start']}-{batch['end']} launched (ID: {openai_batch.id})")
-                
-                if not debug_mode:
-                    os.remove(batch_file_path)
-                    
-            except Exception as e:
-                if "Enqueued token limit" in str(e) or "rate" in str(e).lower():
-                    logging.warning(f"[OpenAI] ⚠️ Rate limit hit, waiting 60s: {e}")
-                    time.sleep(60)
-                else:
-                    logging.error(f"[OpenAI] ❌ Error launching batch: {e}")
-                    batch['status'] = 'failed'
-                    pending.remove(batch)
-                break
-        
-        # Check status of running batches
-        for batch in running[:]:
-            try:
-                status = client.batches.retrieve(batch['openai_batch_id'])
-                
-                if status.status == 'completed':
-                    logging.info(f"[OpenAI] ✅ Batch {batch['start']}-{batch['end']} completed!")
-                    
-                    # Get results
-                    file_response = client.files.content(status.output_file_id)
-                    for line in file_response.iter_lines():
-                        if line:
-                            result = json.loads(line)
-                            try:
-                                response_text = result['response']['body']['choices'][0]['message']['content']
-                                all_responses.append({
-                                    'custom_id': result['custom_id'],
-                                    'response': json.loads(response_text) if response_format else response_text,
-                                })
-                            except (KeyError, json.JSONDecodeError) as e:
-                                logging.warning(f"[OpenAI] Error parsing response: {e}")
-                    
-                    batch['status'] = 'completed'
-                    running.remove(batch)
-                    
-                elif status.status == 'failed':
-                    error_info = getattr(status, 'errors', None) or 'Unknown error'
-                    logging.error(f"[OpenAI] ❌ Batch {batch['start']}-{batch['end']} failed: {error_info}")
-                    batch['status'] = 'failed'
-                    running.remove(batch)
-                    
-            except Exception as e:
-                logging.warning(f"[OpenAI] Error checking batch {batch['start']}-{batch['end']}: {e}")
-                # Don't remove - keep checking
-        
-        # Progress update
-        completed = len([b for b in batches_info if b['status'] == 'completed'])
-        failed = len([b for b in batches_info if b['status'] == 'failed'])
-        running_count = len([b for b in batches_info if b['status'] == 'running'])
-        pending_count = len([b for b in batches_info if b['status'] == 'pending'])
-        
-        if running_count > 0 or pending_count > 0:
-            logging.info(f"[OpenAI] Progress: {completed} ✅ | {running_count} 🔄 | {pending_count} ⏳ | {failed} ❌")
-            time.sleep(15)
+    if checkpoint_paths:
+        completed_ids = load_checkpoint_state(checkpoint_paths)
+        all_responses = load_partial_results(checkpoint_paths)
+        if completed_ids:
+            logging.info(f"[Checkpoint] ⏭️  Resuming: {len(completed_ids)} already completed")
     
-    if debug_mode:
-        return None
+    # Filter out already-completed prompts
+    pending_prompts = [
+        (pid, ptext) for pid, ptext in zip(prompt_ids, prompts)
+        if pid not in completed_ids
+    ]
     
-    # Sort by custom_id to match the order of original prompts
-    all_responses.sort(key=lambda x: int(x['custom_id']))
+    if not pending_prompts:
+        logging.info("[Checkpoint] ✅ All prompts already completed from previous run!")
+        return all_responses
     
-    logging.info(f"[OpenAI] ✅ All batches complete! Got {len(all_responses)} responses")
+    logging.info(f"[Sync] Processing {len(pending_prompts)} prompts with {concurrency} concurrent requests")
+    
+    # Process with thread pool
+    new_responses = []
+    failed_count = 0
+    
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        # Submit all tasks
+        future_to_id = {
+            executor.submit(make_single_request, client, pid, ptext, model_name, response_format): pid
+            for pid, ptext in pending_prompts
+        }
+        
+        # Process as they complete with progress bar
+        with tqdm(total=len(pending_prompts), desc="Processing", unit="req") as pbar:
+            for future in as_completed(future_to_id):
+                prompt_id = future_to_id[future]
+                try:
+                    result = future.result()
+                    
+                    if result.get('response') is not None:
+                        new_responses.append(result)
+                        all_responses.append(result)
+                        completed_ids.add(prompt_id)
+                        
+                        # Checkpoint periodically
+                        if checkpoint_paths and len(new_responses) % checkpoint_every == 0:
+                            save_checkpoint(checkpoint_paths, all_responses, completed_ids)
+                    else:
+                        failed_count += 1
+                        
+                except Exception as e:
+                    logging.warning(f"[Sync] Error processing {prompt_id}: {e}")
+                    failed_count += 1
+                
+                pbar.update(1)
+                pbar.set_postfix({'done': len(new_responses), 'failed': failed_count})
+    
+    # Final checkpoint save
+    if checkpoint_paths and new_responses:
+        save_checkpoint(checkpoint_paths, all_responses, completed_ids)
+    
+    logging.info(f"[Sync] ✅ Complete! {len(new_responses)} new responses, {failed_count} failed")
+    
     return all_responses
 
 
@@ -290,6 +325,61 @@ def compute_embeddings(
     embeddings = model.encode(texts, show_progress_bar=True)
     idx_of_df = narrative_functions.index
     logging.info(f"Successfully computed embeddings of shape {embeddings.shape}")
+    return embeddings, idx_of_df
+
+
+def get_embeddings_cache_path(input_file, embedding_model_name, temp_dir=None):
+    """Generate a cache path for embeddings based on input file and model."""
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    model_name_safe = embedding_model_name.replace('/', '_')
+    cache_dir = temp_dir or os.path.dirname(input_file) or '.'
+    return os.path.join(cache_dir, f"{base_name}_embeddings_{model_name_safe}.npz")
+
+
+def save_embeddings(embeddings, idx_of_df, cache_path):
+    """Save embeddings and indices to disk."""
+    logging.info(f"[Embeddings] 💾 Saving embeddings to: {cache_path}")
+    np.savez_compressed(
+        cache_path,
+        embeddings=embeddings,
+        idx_of_df=np.array(idx_of_df)
+    )
+    logging.info(f"[Embeddings] ✅ Saved {len(embeddings)} embeddings ({os.path.getsize(cache_path) / 1024 / 1024:.1f} MB)")
+
+
+def load_embeddings(cache_path):
+    """Load embeddings and indices from disk."""
+    logging.info(f"[Embeddings] 📂 Loading cached embeddings from: {cache_path}")
+    data = np.load(cache_path)
+    embeddings = data['embeddings']
+    idx_of_df = pd.Index(data['idx_of_df'])
+    logging.info(f"[Embeddings] ✅ Loaded {len(embeddings)} embeddings of shape {embeddings.shape}")
+    return embeddings, idx_of_df
+
+
+def get_or_compute_embeddings(input_df, embedding_model_name, text_col_name, input_file, temp_dir=None):
+    """
+    Get embeddings from cache if available, otherwise compute and save them.
+    """
+    cache_path = get_embeddings_cache_path(input_file, embedding_model_name, temp_dir)
+    
+    if os.path.exists(cache_path):
+        try:
+            embeddings, idx_of_df = load_embeddings(cache_path)
+            # Verify the cached embeddings match the current input
+            if len(embeddings) == len(input_df):
+                return embeddings, idx_of_df
+            else:
+                logging.warning(f"[Embeddings] ⚠️ Cache size mismatch ({len(embeddings)} vs {len(input_df)}), recomputing...")
+        except Exception as e:
+            logging.warning(f"[Embeddings] ⚠️ Failed to load cache: {e}, recomputing...")
+    
+    # Compute embeddings
+    embeddings, idx_of_df = compute_embeddings(input_df, embedding_model_name, text_col_name=text_col_name)
+    
+    # Save to cache
+    save_embeddings(embeddings, idx_of_df, cache_path)
+    
     return embeddings, idx_of_df
 
 
@@ -611,13 +701,12 @@ def get_prompt_template(prompt_template):
 
 def main():
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Process narrative function similarity.')
+    parser = argparse.ArgumentParser(description='Process narrative function similarity using synchronous OpenAI API.')
     parser.add_argument('--input_file', type=str, default=None, help='Input data file.')
     parser.add_argument('--output_file', type=str, default=None, help='Output file filename.')
     parser.add_argument('--prompt_template', type=str, default='generic', help='Either a file, an experiment name, or a string literal')
     parser.add_argument('--embedding_model_name', type=str, default='all-MiniLM-L6-v2', help='SentenceTransformer model name for embeddings.')
-    parser.add_argument('--use_openai', action='store_true', help='Use OpenAI instead of VLLM')
-    parser.add_argument('--model_name', type=str, default="meta-llama/Meta-Llama-3.1-70B-Instruct", help='Model name for prompting an LLM.')
+    parser.add_argument('--model_name', type=str, default="gpt-4o-mini", help='OpenAI model name for prompting.')
     parser.add_argument('--text_col_name', type=str, default=None, help='Column name to compute embeddings for.')
     parser.add_argument('--text_col_name_2', type=str, default=None, help='If there is a second text column (e.g. one column for the "Label", another for the "Description").')
     parser.add_argument('--text_keyword_name', type=str, default='Label', help='Keyword to use in the prompt.')
@@ -626,9 +715,8 @@ def main():
     parser.add_argument('--sample_size', type=int, default=2_000_000, help='Number of sample pairs to process.')
     parser.add_argument('--k', type=int, default=5, help='Number of pairs per prompt.')
     parser.add_argument('--batch_size', type=int, default=40_000, help='Batch size for similarity computation.')
-    parser.add_argument('--openai_batch_size', type=int, default=2000, help='Number of prompts per OpenAI batch file (keep small to avoid token limits).')
-    parser.add_argument('--max_concurrent_batches', type=int, default=2, help='Max concurrent OpenAI batches to avoid rate limits.')
-    parser.add_argument('--completion_window', type=str, default='24h', help='Completion window for OpenAI batch processing.')
+    parser.add_argument('--concurrency', type=int, default=50, help='Number of concurrent API requests (default: 50)')
+    parser.add_argument('--checkpoint_every', type=int, default=100, help='Save checkpoint every N responses (default: 100)')
     parser.add_argument('--debug', action='store_true', help='Debug mode.')
     parser.add_argument('--temp_dir', type=str, default=None, help='Directory to store temporary files.')
     args = parser.parse_args()
@@ -643,8 +731,14 @@ def main():
 
     # Step 0: create data for training a similarity model
     # ----------------------------------------------------------------
-    logging.info("Computing embeddings")
-    embeddings, idx_of_df = compute_embeddings(input_df, args.embedding_model_name, text_col_name='text_col')
+    logging.info("Getting embeddings (will load from cache if available)")
+    embeddings, idx_of_df = get_or_compute_embeddings(
+        input_df, 
+        args.embedding_model_name, 
+        text_col_name='text_col',
+        input_file=args.input_file,
+        temp_dir=args.temp_dir
+    )
     if args.debug:
         embeddings = embeddings[:10_000]
         idx_of_df = idx_of_df[:10_000]
@@ -677,44 +771,22 @@ def main():
         with open('debug_prompts.txt', 'w') as f:
             f.write('\n'.join(all_prompts))
 
-    if args.use_openai:
-        logging.info(f"Using OpenAI model: {args.model_name}")
-        # Generate responses using OpenAI
-        logging.info("Generating responses with OpenAI")
-        results = generate_responses(
-            prompt_ids=[str(i) for i in range(len(all_prompts))],
-            prompts=all_prompts,
-            model_name=args.model_name,
-            temperature=0.1,
-            batch_size=args.openai_batch_size,  # Use smaller batch size for OpenAI
-            debug_mode=args.debug,
-            temp_dir=args.temp_dir,
-            batch_type="similarity",
-            response_format=MultiSimilarityResponse,
-            max_concurrent_batches=args.max_concurrent_batches,
-        )
-        
-        # Match results to prompts
-        logging.info("Matching OpenAI results to prompts")
-        full_data_exp_df = match_batched_openai_results_to_prompts(results, all_batched_inputs)
-    else:
-        logging.info(f"Using VLLM model: {args.model_name}")
-        # Only import VLLM-related modules when needed
-        os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-        os.environ['VLLM_ALLOW_LONG_MAX_MODEL_LEN'] = '1'
-        from utils_vllm_client import run_vllm_batch
-        results = run_vllm_batch(
-            all_prompts, 
-            args.model_name, 
-            include_system_prompt=not ('gemma' in args.model_name),
-            batch_size=args.batch_size,
-            debug_mode=False,
-            temp_dir=args.temp_dir,
-            batch_type="similarity",
-            response_format=MultiSimilarityResponse,
-        )
-        logging.info("Matching VLLM results to prompts")
-        full_data_exp_df = match_batched_vllm_results_to_prompts(results, all_batched_inputs)
+    # Generate responses using synchronous OpenAI API
+    logging.info(f"Using OpenAI model: {args.model_name} (synchronous mode, concurrency={args.concurrency})")
+    results = generate_responses_sync(
+        prompt_ids=[str(i) for i in range(len(all_prompts))],
+        prompts=all_prompts,
+        model_name=args.model_name,
+        response_format=MultiSimilarityResponse,
+        temp_dir=args.temp_dir,
+        output_file=args.output_file,
+        concurrency=args.concurrency,
+        checkpoint_every=args.checkpoint_every,
+    )
+    
+    # Match results to prompts
+    logging.info("Matching sync results to prompts")
+    full_data_exp_df = match_batched_openai_results_to_prompts(results, all_batched_inputs)
 
     if args.debug:
         logging.info("Writing debug results to file")
@@ -741,6 +813,10 @@ def main():
     logging.info(f"Saving {len(triplets)} triplets to: {triplets_path}")
     with jsonlines.open(triplets_path, 'a') as f:
         f.write_all(triplets)
+    
+    # Clean up checkpoint files on successful completion
+    checkpoint_paths = get_checkpoint_paths(args.output_file, args.temp_dir)
+    cleanup_checkpoint_files(checkpoint_paths)
         
     logging.info("Processing complete")
 
@@ -749,73 +825,49 @@ if __name__ == "__main__":
 
 
 """
-use this command to run the script using OpenAI:
+Example commands using synchronous OpenAI API:
 
-python create_supervised_similarity_data.py \
-    --input_file ../experiments/editorial/editorial-discourse-initial-labeling-labeling__experiment-editorials__model_gpt-4o-mini__0_1635.json \
-    --output_file ../experiments/editorial/gpt-4o-mini-similarity-data.jsonl \
+# Basic usage with default concurrency (50)
+python src/step_2_abridged_sync.py \
+    --input_file experiments/editorial/step1_labels.json \
+    --output_file experiments/editorial/similarity-data.jsonl \
     --model_name gpt-4o-mini \
-    --use_openai \
-    --batch_size 500 \
     --text_col_name label \
     --text_col_name_2 description \
-    --sample_size 500_000 \
-    
+    --sample_size 100_000 \
+    --concurrency 50 \
+    --checkpoint_every 100 \
+    --temp_dir experiments/editorial/temp_batches
 
-    
-python src/step_2__create_supervised_similarity_data.py \
-    --input_file experiments/emotions/emotions-initial-labeling-labeling__experiment-emotions__model_gpt-4o-mini__0_26404.json \
-    --output_file experiments/emotions/vllm-similarity-data.jsonl \
-    --model_name meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --batch_size 5000 \
+# Higher concurrency for faster processing
+python src/step_2_abridged_sync.py \
+    --input_file experiments/emotions/step1_labels.json \
+    --output_file experiments/emotions/similarity-data.jsonl \
+    --model_name gpt-4o-mini \
     --prompt_template emotions \
     --min_sim_threshold 0.5 \
     --max_sim_threshold 0.9 \
     --text_col_name label \
     --text_col_name_2 description \
-    --sample_size 10_000 \
-    --debug \
+    --sample_size 200_000 \
+    --concurrency 100 \
+    --checkpoint_every 200 \
     --temp_dir experiments/emotions/temp_batches
 
-
-python src/step_2__create_supervised_similarity_data.py \
-    --input_file experiments/news-discourse/news-discourse-initial-labeling-labeling__experiment-news-discourse__model_gpt-4o-mini__0_2155.json \
-    --output_file experiments/news-discourse/vllm-similarity-data-more-similar.jsonl \
-    --model_name meta-llama/Meta-Llama-3.1-70B-Instruct \
-    --batch_size 5000 \
-    --prompt_template news_discourse \
-    --min_sim_threshold 0.5 \
-    --max_sim_threshold 0.9 \
-    --text_col_name label \
-    --text_col_name_2 description \
-    --sample_size 200_000 \
-    --temp_dir experiments/news-discourse/temp_batches    
-
-python src/step_2__create_supervised_similarity_data.py \
-    --input_file experiments/hate-speech/hate-speech-initial-labeling-labeling__experiment-hate-speech__model_gpt-4o-mini__0_457.json \
-    --output_file experiments/hate-speech/vllm-similarity-data.jsonl \
-    --model_name meta-llama/Meta-Llama-3.1-70B-Instruct \
-    --batch_size 5000 \
+# Debug mode (smaller sample)
+python src/step_2_abridged_sync.py \
+    --input_file experiments/hate-speech/step1_labels.json \
+    --output_file experiments/hate-speech/similarity-data.jsonl \
+    --model_name gpt-4o-mini \
     --prompt_template hate_speech \
     --min_sim_threshold 0.3 \
     --max_sim_threshold 0.9 \
     --text_col_name label \
     --text_col_name_2 description \
-    --sample_size 200_000 \
-    --temp_dir experiments/hate-speech/temp_batches    
-
-python src/step_2__create_supervised_similarity_data.py \
-    --input_file experiments/editorial/editorial-discourse-initial-labeling-labeling__experiment-editorials__model_gpt-4o-mini__0_1635.json \
-    --output_file experiments/editorial/vllm-similarity-data.jsonl \
-    --model_name meta-llama/Meta-Llama-3.1-70B-Instruct \
-    --batch_size 5000 \
-    --prompt_template editorial \
-    --min_sim_threshold 0.5 \
-    --max_sim_threshold 0.9 \
-    --text_col_name label \
-    --text_col_name_2 description \
-    --sample_size 200_000 \
-    --temp_dir experiments/editorial/temp_batches    
+    --sample_size 10_000 \
+    --concurrency 20 \
+    --debug \
+    --temp_dir experiments/hate-speech/temp_batches
 """
 
 

@@ -1,18 +1,20 @@
 """
 OpenAI-only version of Step 1: Initial Labeling
-MEMORY-EFFICIENT VERSION - generates prompts on-demand instead of all at once.
-Works on machines with limited RAM (e.g., 8GB MacBook Air).
+SYNCHRONOUS API VERSION - uses direct API calls instead of batch API.
+Faster and more reliable than batch API when batches are stuck.
+Uses concurrent requests for speed.
 """
 
 import time
 _start_time = time.time()
-print("🚀 Starting Step 1: Initial Labeling (OpenAI mode)")
+print("🚀 Starting Step 1: Initial Labeling (Synchronous API mode)")
 print("⏳ Loading libraries...\n")
 
 import pandas as pd
 import os, json
 import logging
 from tqdm.auto import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from prompts import (
     EDITORIAL_INITIAL_LABELING_PROMPT, 
@@ -71,7 +73,7 @@ def check_existing_outputs(output_fname, start_idx, end_idx):
 
 
 # ============================================================================
-# CHECKPOINTING FUNCTIONS
+# CHECKPOINTING FUNCTIONS (for sync mode)
 # ============================================================================
 
 def get_checkpoint_paths(output_fname, temp_dir):
@@ -80,41 +82,37 @@ def get_checkpoint_paths(output_fname, temp_dir):
     checkpoint_dir = temp_dir or os.path.dirname(output_fname) or '.'
     return {
         'results': f"{base}_partial_results.jsonl",
-        'state': os.path.join(checkpoint_dir, f"{os.path.basename(base)}_batch_state.json"),
+        'state': os.path.join(checkpoint_dir, f"{os.path.basename(base)}_sync_state.json"),
     }
 
 
-def save_batch_results(checkpoint_paths, batch_responses, batch_info):
-    """Append completed batch results to disk immediately."""
-    # Append results
-    with open(checkpoint_paths['results'], 'a') as f:
-        for resp in batch_responses:
+def save_all_results(checkpoint_paths, all_responses):
+    """Save ALL results to disk (overwrites previous checkpoint)."""
+    with open(checkpoint_paths['results'], 'w') as f:
+        for resp in all_responses:
             f.write(json.dumps(resp) + '\n')
-    
-    # Update state
-    state = load_checkpoint_state(checkpoint_paths)
-    state['completed_batches'].append({
-        'start': batch_info['start'],
-        'end': batch_info['end'],
-        'count': len(batch_responses),
-    })
-    state['total_responses'] += len(batch_responses)
-    
+
+
+def save_checkpoint_state(checkpoint_paths, completed_ids):
+    """Save the set of completed prompt IDs."""
     with open(checkpoint_paths['state'], 'w') as f:
-        json.dump(state, f, indent=2)
-    
-    logging.info(f"[Checkpoint] 💾 Saved {len(batch_responses)} responses (total: {state['total_responses']})")
+        json.dump({'completed_ids': list(completed_ids)}, f)
+
+
+def save_checkpoint(checkpoint_paths, all_responses, completed_ids):
+    """Save full checkpoint: all responses + all completed IDs."""
+    save_all_results(checkpoint_paths, all_responses)
+    save_checkpoint_state(checkpoint_paths, completed_ids)
+    logging.info(f"[Checkpoint] 💾 Saved {len(all_responses)} responses")
 
 
 def load_checkpoint_state(checkpoint_paths):
     """Load existing checkpoint state or create new."""
     if os.path.exists(checkpoint_paths['state']):
         with open(checkpoint_paths['state'], 'r') as f:
-            return json.load(f)
-    return {
-        'completed_batches': [],
-        'total_responses': 0,
-    }
+            data = json.load(f)
+            return set(data.get('completed_ids', []))
+    return set()
 
 
 def load_partial_results(checkpoint_paths):
@@ -264,22 +262,64 @@ def count_total_prompts(input_df, multi_sentence=False, num_sents_per_prompt=8):
 
 
 # ============================================================================
-# PROCESSING FUNCTIONS
+# PROCESSING FUNCTIONS (Synchronous API)
 # ============================================================================
 
-def process_all_openai(prompts, model_name, batch_size, debug_mode, temp_dir, 
-                       num_sents_per_prompt, response_format, run_id, experiment,
-                       max_concurrent_batches=2, output_fname=None):
+def make_single_request(client, prompt_id, prompt_text, model_name, response_format):
+    """Make a single synchronous API request with retry logic."""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = client.beta.chat.completions.parse(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt_text}],
+                response_format=response_format,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            
+            # Extract the parsed response
+            parsed = response.choices[0].message.parsed
+            if parsed:
+                return {
+                    'custom_id': prompt_id,
+                    'response': parsed.model_dump(),
+                }
+            else:
+                # Fallback to raw content if parsing failed
+                content = response.choices[0].message.content
+                return {
+                    'custom_id': prompt_id,
+                    'response': json.loads(content) if content else None,
+                }
+                
+        except Exception as e:
+            if "rate" in str(e).lower() and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5
+                time.sleep(wait_time)
+            elif attempt == max_retries - 1:
+                logging.warning(f"[Sync] Failed after {max_retries} attempts for {prompt_id}: {e}")
+                return {
+                    'custom_id': prompt_id,
+                    'response': None,
+                    'error': str(e),
+                }
+            else:
+                time.sleep(1)
+    
+    return {'custom_id': prompt_id, 'response': None, 'error': 'Unknown error'}
+
+
+def process_all_openai_sync(prompts, model_name, temp_dir, num_sents_per_prompt, 
+                            response_format, experiment, output_fname=None,
+                            concurrency=50, checkpoint_every=100):
     """
-    Process all prompts using OpenAI's batch API.
-    Rate-limit aware - only launches a few batches at a time.
-    Supports checkpointing for resume after interruption.
+    Process all prompts using synchronous OpenAI API with concurrent requests.
+    Much faster than batch API when batches are stuck.
     """
     from openai import OpenAI
-    import jsonlines
-    from openai.lib._parsing._completions import type_to_response_format_param
     
-    logging.info("[OpenAI] Initializing client...")
+    logging.info("[Sync] Initializing OpenAI client...")
     client = OpenAI()
     
     if temp_dir is None:
@@ -288,44 +328,27 @@ def process_all_openai(prompts, model_name, batch_size, debug_mode, temp_dir,
     
     # Setup checkpointing
     checkpoint_paths = get_checkpoint_paths(output_fname, temp_dir) if output_fname else None
-    if checkpoint_paths:
-        state = load_checkpoint_state(checkpoint_paths)
-        all_responses = load_partial_results(checkpoint_paths)
-        completed_ranges = {(b['start'], b['end']) for b in state['completed_batches']}
-        logging.info(f"[Checkpoint] Found {len(completed_ranges)} previously completed batches")
-    else:
-        all_responses = []
-        completed_ranges = set()
+    completed_ids = set()
+    all_responses = []
     
+    if checkpoint_paths:
+        completed_ids = load_checkpoint_state(checkpoint_paths)
+        all_responses = load_partial_results(checkpoint_paths)
+        if completed_ids:
+            logging.info(f"[Checkpoint] ⏭️  Resuming: {len(completed_ids)} already completed")
+    
+    # Prepare prompts to process
     prompt_ids = prompts['index'].tolist()
     prompt_texts = prompts['prompt'].tolist()
     
-    # Split into batches, skipping already-completed ones
-    batches_info = []
-    skipped_count = 0
-    for i in range(0, len(prompt_texts), batch_size):
-        end = min(i + batch_size, len(prompt_texts))
-        
-        # Skip already-completed batches
-        if (i, end) in completed_ranges:
-            skipped_count += 1
-            continue
-            
-        batches_info.append({
-            'start': i,
-            'end': end,
-            'prompt_ids': prompt_ids[i:end],
-            'prompts': prompt_texts[i:end],
-            'status': 'pending',
-            'openai_batch_id': None,
-        })
+    # Filter out already-completed prompts
+    pending_prompts = [
+        (pid, ptext) for pid, ptext in zip(prompt_ids, prompt_texts)
+        if pid not in completed_ids
+    ]
     
-    if skipped_count > 0:
-        logging.info(f"[Checkpoint] ⏭️  Skipped {skipped_count} already-completed batches")
-    
-    if not batches_info:
-        logging.info("[Checkpoint] ✅ All batches already completed from previous run!")
-        # Return existing results
+    if not pending_prompts:
+        logging.info("[Checkpoint] ✅ All prompts already completed from previous run!")
         if all_responses:
             output_df = pd.DataFrame(all_responses)
             output_df = output_df.merge(prompts, left_on='custom_id', right_on='index')
@@ -333,150 +356,53 @@ def process_all_openai(prompts, model_name, batch_size, debug_mode, temp_dir,
             return output_df
         return None
     
-    logging.info(f"[OpenAI] {len(batches_info)} batches remaining of ~{batch_size} prompts each")
-    logging.info(f"[OpenAI] Will run max {max_concurrent_batches} batches at a time (run_id: {run_id})")
+    logging.info(f"[Sync] Processing {len(pending_prompts)} prompts with {concurrency} concurrent requests")
     
-    all_responses = []
+    # Process with thread pool
+    new_responses = []
+    failed_count = 0
     
-    while any(b['status'] in ['pending', 'running'] for b in batches_info):
-        # Count running batches
-        running = [b for b in batches_info if b['status'] == 'running']
-        pending = [b for b in batches_info if b['status'] == 'pending']
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        # Submit all tasks
+        future_to_id = {
+            executor.submit(make_single_request, client, pid, ptext, model_name, response_format): pid
+            for pid, ptext in pending_prompts
+        }
         
-        # Launch new batches if we have room
-        while len(running) < max_concurrent_batches and pending:
-            batch = pending[0]
-            logging.info(f"[OpenAI] Launching batch {batch['start']}-{batch['end']}...")
-            
-            try:
-                # Create batch file
-                batch_requests = []
-                format_json = type_to_response_format_param(response_format)
-                
-                # Add strict: true for reliable structured output
-                if format_json.get('type') == 'json_schema' and 'json_schema' in format_json:
-                    format_json['json_schema']['strict'] = True
-                
-                for pid, prompt in zip(batch['prompt_ids'], batch['prompts']):
-                    batch_requests.append({
-                        "custom_id": pid,
-                        "method": "POST",
-                        "url": "/v1/chat/completions",
-                        "body": {
-                            "model": model_name,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "temperature": 0.1,
-                            "max_tokens": 1024,
-                            "response_format": format_json,
-                        }
-                    })
-                
-                # Write to file
-                batch_file_path = os.path.join(temp_dir, f'batch_{batch["start"]}_{batch["end"]}.jsonl')
-                with jsonlines.open(batch_file_path, 'w') as f:
-                    f.write_all(batch_requests)
-                
-                # Upload and create batch (use context manager for file)
-                with open(batch_file_path, "rb") as batch_file_handle:
-                    batch_file = client.files.create(file=batch_file_handle, purpose="batch")
-                
-                openai_batch = client.batches.create(
-                    input_file_id=batch_file.id,
-                    endpoint="/v1/chat/completions",
-                    completion_window="24h"
-                )
-                
-                batch['openai_batch_id'] = openai_batch.id
-                batch['status'] = 'running'
-                running.append(batch)
-                pending.remove(batch)
-                
-                logging.info(f"[OpenAI] ✅ Batch {batch['start']}-{batch['end']} launched (ID: {openai_batch.id})")
-                
-                if not debug_mode:
-                    os.remove(batch_file_path)
+        # Process as they complete with progress bar
+        with tqdm(total=len(pending_prompts), desc="Processing", unit="req") as pbar:
+            for future in as_completed(future_to_id):
+                prompt_id = future_to_id[future]
+                try:
+                    result = future.result()
                     
-            except Exception as e:
-                if "Enqueued token limit" in str(e) or "rate" in str(e).lower():
-                    logging.warning(f"[OpenAI] Rate limit hit, waiting 30s: {e}")
-                    time.sleep(30)
-                else:
-                    logging.error(f"[OpenAI] Error launching batch: {e}")
-                    batch['status'] = 'failed'
-                    pending.remove(batch)
-                break
-        
-        # Check status of running batches
-        for batch in running[:]:  # Copy list to allow modification
-            try:
-                status = client.batches.retrieve(batch['openai_batch_id'])
-                
-                if status.status == 'completed':
-                    logging.info(f"[OpenAI] ✅ Batch {batch['start']}-{batch['end']} completed!")
-                    
-                    # Get results for this batch
-                    batch_responses = []
-                    file_response = client.files.content(status.output_file_id)
-                    for line in file_response.iter_lines():
-                        if line:
-                            result = json.loads(line)
-                            try:
-                                response_text = result['response']['body']['choices'][0]['message']['content']
-                                batch_responses.append({
-                                    'custom_id': result['custom_id'],
-                                    'response': json.loads(response_text),
-                                })
-                            except (KeyError, json.JSONDecodeError) as e:
-                                logging.warning(f"[OpenAI] Error parsing response: {e}")
-                    
-                    # IMMEDIATE CHECKPOINT: Save this batch's results to disk
-                    if checkpoint_paths:
-                        save_batch_results(checkpoint_paths, batch_responses, batch)
-                    
-                    all_responses.extend(batch_responses)
-                    batch['status'] = 'completed'
-                    running.remove(batch)
-                    
-                elif status.status == 'failed':
-                    error_info = getattr(status, 'errors', None)
-                    if error_info:
-                        # Try to get error message from errors object
-                        error_msg = str(error_info)
+                    if result.get('response') is not None:
+                        new_responses.append(result)
+                        all_responses.append(result)
+                        completed_ids.add(prompt_id)
+                        
+                        # Checkpoint periodically - save ALL responses
+                        if checkpoint_paths and len(new_responses) % checkpoint_every == 0:
+                            save_checkpoint(checkpoint_paths, all_responses, completed_ids)
                     else:
-                        error_msg = 'Unknown error'
-                    logging.error(f"[OpenAI] ❌ Batch {batch['start']}-{batch['end']} failed: {error_msg}")
-                    batch['status'] = 'failed'
-                    running.remove(batch)
-                    
-                # Log other statuses occasionally
-                elif status.status in ['validating', 'in_progress', 'finalizing']:
-                    pass  # Normal, just waiting
-                    
-            except Exception as e:
-                logging.warning(f"[OpenAI] Error checking batch {batch['start']}-{batch['end']}: {e}")
-                # Don't remove - just continue checking next time
-        
-        # Progress update
-        completed = len([b for b in batches_info if b['status'] == 'completed'])
-        failed = len([b for b in batches_info if b['status'] == 'failed'])
-        running_count = len([b for b in batches_info if b['status'] == 'running'])
-        pending_count = len([b for b in batches_info if b['status'] == 'pending'])
-        
-        if running_count > 0 or pending_count > 0:
-            logging.info(f"[OpenAI] Progress: {completed} ✅ | {running_count} 🔄 | {pending_count} ⏳ | {failed} ❌")
-            time.sleep(10)
+                        failed_count += 1
+                        
+                except Exception as e:
+                    logging.warning(f"[Sync] Error processing {prompt_id}: {e}")
+                    failed_count += 1
+                
+                pbar.update(1)
+                pbar.set_postfix({'done': len(new_responses), 'failed': failed_count})
     
-    # Check for debug mode
-    if debug_mode:
-        logging.info("[OpenAI] Debug mode - stopping before processing results")
-        return None
+    # Final checkpoint save (in case last batch wasn't a multiple of checkpoint_every)
+    if checkpoint_paths and new_responses:
+        save_checkpoint(checkpoint_paths, all_responses, completed_ids)
     
-    # Check if we got any responses
+    logging.info(f"[Sync] ✅ Complete! {len(new_responses)} new responses, {failed_count} failed")
+    
     if not all_responses:
-        logging.error("[OpenAI] ❌ No responses received! Check batch status on OpenAI dashboard.")
+        logging.error("[Sync] ❌ No responses received!")
         return None
-    
-    logging.info(f"[OpenAI] ✅ All batches complete! Got {len(all_responses)} responses")
     
     # Create output DataFrame
     output_df = pd.DataFrame(all_responses)
@@ -531,15 +457,15 @@ def postprocess_outputs(output_df, experiment, num_sents_per_prompt):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Step 1: Initial Labeling using synchronous OpenAI API")
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument('--input_data_file', type=str, required=True)
     parser.add_argument('--experiment', type=str, default='editorials')
     parser.add_argument('--start_idx', type=int, default=None)
     parser.add_argument('--end_idx', type=int, default=None)
     parser.add_argument('--output_file', type=str, required=True)
-    parser.add_argument('--batch_size', type=int, default=500)
-    parser.add_argument('--debug_mode', action='store_true')
+    parser.add_argument('--concurrency', type=int, default=50, help='Number of concurrent API requests (default: 50)')
+    parser.add_argument('--checkpoint_every', type=int, default=100, help='Save checkpoint every N responses (default: 100)')
     parser.add_argument('--temp_dir', type=str, default=None)
     parser.add_argument('--num_sents_per_prompt', type=int, default=8)
     
@@ -628,18 +554,17 @@ if __name__ == "__main__":
     with open(output_fname, 'w') as f:
         f.write('')
     
-    logging.info(f"[Step 5/5] Starting OpenAI API calls...")
-    model_outputs = process_all_openai(
+    logging.info(f"[Step 5/5] Starting synchronous OpenAI API calls (concurrency={args.concurrency})...")
+    model_outputs = process_all_openai_sync(
         prompts=prompts, 
         model_name=args.model, 
-        batch_size=args.batch_size, 
-        debug_mode=args.debug_mode, 
         temp_dir=args.temp_dir, 
         num_sents_per_prompt=args.num_sents_per_prompt,
         response_format=prompts['response_format'].iloc[0],
         experiment=args.experiment,
-        run_id=f"{args.experiment}__{args.model.replace('/', '-')}__{args.start_idx}_{args.end_idx}",
         output_fname=output_fname,
+        concurrency=args.concurrency,
+        checkpoint_every=args.checkpoint_every,
     )
     
     if model_outputs is not None and len(model_outputs) > 0:
