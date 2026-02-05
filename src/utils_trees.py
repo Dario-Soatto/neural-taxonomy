@@ -295,6 +295,9 @@ def label_hierarchical_tree(
     num_iterations_to_run_labeling = 1 if (not use_discretization and not use_child_nodes) else num_iterations_to_run_labeling
     for i in range(num_iterations_to_run_labeling):
         for p in tqdm(nodes, desc=f"Labeling nodes, iteration {i + 1} of {num_iterations_to_run_labeling}..."):
+            # Skip leaves or already-labeled nodes to avoid sampling from empty descendants
+            if G.nodes[p].get('level') == 'leaf' or 'label' in G.nodes[p]:
+                continue
             if use_discretization and 'datapoint_indices' in G.nodes[p]:
                 datapoint_indices = G.nodes[p]['datapoint_indices']
                 if datapoint_indices and len(datapoint_indices) > 0:

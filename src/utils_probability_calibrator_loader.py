@@ -38,8 +38,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ------------------------------------------------------------
 
 def build_hf_logprob_fns(
-    model_name_or_path: str, 
-    cache_dir: Optional[str] = None, 
+    model_name_or_path,
+    cache_dir: Optional[str] = None,
     device_map: str = "auto"
 ) -> Tuple[Callable, Callable, Callable]:
     """Return (single_fn, batch_fn, full_fn) using local HF model.
@@ -57,14 +57,21 @@ def build_hf_logprob_fns(
 
     # Load model and tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, cache_dir=cache_dir)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path, 
-            cache_dir=cache_dir,
-            device_map=device_map,
-            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        )
-        tokenizer.pad_token = tokenizer.eos_token
+        if isinstance(model_name_or_path, str):
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, cache_dir=cache_dir)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                cache_dir=cache_dir,
+                device_map=device_map,
+                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            )
+        else:
+            model = model_name_or_path
+            tokenizer = cache_dir
+            if tokenizer is None:
+                raise ValueError("Tokenizer instance must be provided when passing a model instance.")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
     except Exception as e:
         logging.error(f"Error loading model {model_name_or_path}: {e}")
         raise
@@ -367,7 +374,14 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
     
     try:
         # Initialize the LLM model and parameters
-        llm = LLM(model_name_or_path)
+        max_model_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "4096"))
+        gpu_mem_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.90"))
+        llm = LLM(
+            model_name_or_path,
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_mem_util,
+            enforce_eager=True,
+        )
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     except Exception as e:
@@ -388,7 +402,7 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
             full_text = prompt + choice
             
             # Generate with vLLM
-            output = llm.generate([full_text], sampling_params=sampling_params)[0]
+            output = llm.generate([full_text], sampling_params=sampling_params, use_tqdm=False)[0]
             
             if not output.prompt_logprobs:
                 raise ValueError("No prompt_logprobs retrieved from vLLM.")
@@ -447,7 +461,7 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
             batch_texts = [p + c for p, c in zip(batch_prompts, batch_choices)]
             
             # Generate with vLLM batch
-            batch_outputs = llm.generate(batch_texts, sampling_params=sampling_params)
+            batch_outputs = llm.generate(batch_texts, sampling_params=sampling_params, use_tqdm=False)
             
             # Process each output
             for j, (prompt, output) in enumerate(zip(batch_prompts, batch_outputs)):
@@ -465,6 +479,8 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
                 # Handle the complex logprob structure
                 log_prob_sum = 0.0
                 for token_dict in choice_logprobs:
+                    if token_dict is None:
+                        continue
                     for logprob_obj in token_dict.values():
                         log_prob_sum += logprob_obj.logprob
                         break  # Only need the first (top) logprob for each token
@@ -476,7 +492,7 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
     def full_text_log_prob_sum(text):
         """Get log probability sum for the entire text."""
         # Generate with vLLM
-        output = llm.generate([text], sampling_params=sampling_params)[0]
+        output = llm.generate([text], sampling_params=sampling_params, use_tqdm=False)[0]
         
         if not output.prompt_logprobs:
             raise ValueError("No prompt_logprobs retrieved from vLLM.")
@@ -484,6 +500,8 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
         # Sum the log probabilities for all tokens, handling the complex structure
         log_prob_sum = 0.0
         for token_dict in output.prompt_logprobs:
+            if token_dict is None:
+                continue
             for logprob_obj in token_dict.values():
                 log_prob_sum += logprob_obj.logprob
                 break  # Only need the first (top) logprob for each token
@@ -544,7 +562,7 @@ Your response: """
     prompt_len = len(prompt_tokens)
     full_text = test_prompt + test_choices[0]
     print(f"Generating with vLLM for prompt+choice...")
-    output = llm_instance.generate([full_text], sampling_params=sampling_params_instance)[0]
+    output = llm_instance.generate([full_text], sampling_params=sampling_params_instance, use_tqdm=False)[0]
     
     if output.prompt_logprobs:
         # Extract only logprobs for the choice tokens

@@ -30,6 +30,7 @@ from sentence_transformers import SentenceTransformer
 import logging
 import re
 import os
+import json
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(lineno)d - %(message)s",
@@ -99,12 +100,21 @@ def assign_kmeans_clusters(embs, save_path=None, kmeans=None):
 
 
 def read_dataframe(input_data_file, experiment=None):
-    if '.json' in input_data_file:
+    if not os.path.exists(input_data_file):
+        raise FileNotFoundError(f"Input data file not found: {input_data_file}")
+
+    if any(ext in input_data_file for ext in ['.jsonl', '.json', '.json.gz']):
         df = pd.read_json(input_data_file, lines=True)
     elif '.csv' in input_data_file:
         df = pd.read_csv(input_data_file)
     else:
         raise ValueError(f"Unsupported file type: {input_data_file}")   
+
+    if 'response' in df.columns:
+        if 'label' not in df.columns:
+            df['label'] = df['response'].apply(_extract_response_field, field_name='label')
+        if 'description' not in df.columns:
+            df['description'] = df['response'].apply(_extract_response_field, field_name='description')
     
     if experiment is not None and 'reasoning' in experiment:
         if '__' in experiment:
@@ -112,6 +122,19 @@ def read_dataframe(input_data_file, experiment=None):
             df = df.loc[lambda df: df['index'].str.split('__').str.get(0) == subsection] # this is a hack to get the correct subsection of the data
     
     return df
+
+
+def _extract_response_field(response_value, field_name):
+    if isinstance(response_value, dict):
+        return response_value.get(field_name)
+    if isinstance(response_value, str):
+        try:
+            parsed = json.loads(response_value)
+            if isinstance(parsed, dict):
+                return parsed.get(field_name)
+        except Exception:
+            return None
+    return None
 
 
 if __name__ == "__main__":

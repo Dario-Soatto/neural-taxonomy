@@ -2,6 +2,7 @@ import logging
 import itertools
 import numpy as np
 import torch
+import math
 from typing import Callable, List, Optional
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -93,17 +94,10 @@ class ProbabilityCalibrator:
         self.batch_prompts = batch_prompts
         self.batch_permutations = batch_permutations
 
-        # Precompute all permutations of choices (used for self.num_trials sampling)
-        self.permutations = list(itertools.permutations(self.choices)) if self.choices else []
-        if self.num_trials > 0 and self.num_trials > len(self.permutations) and len(self.permutations) > 0:
-            logging.warning(
-                f"num_trials ({self.num_trials}) is greater than the number of unique permutations ({len(self.permutations)}). "
-                f"Reducing num_trials to {len(self.permutations)} to avoid sampling with replacement for permutations."
-            )
-            self.num_trials = len(self.permutations)
-        elif not self.permutations and self.num_trials > 0:
-            logging.warning("No choices provided, so no permutations to sample. num_trials will be effectively 0 for P(z|X) calculation related to permutations.")
-            # self.num_trials could be set to 0 here, or logic in compute_log_p_z_given_X needs to handle empty permutations
+        # Build a manageable permutation pool without materializing N! for large N.
+        self.sampled_permutations = self._build_sampled_permutations()
+        if not self.sampled_permutations and self.num_trials > 0:
+            logging.warning("No permutations available for calibration; num_trials will be effectively 0.")
 
         # Precompute log p(z|CF)
         self.log_probs_cf = self.compute_log_p_z_given_X(self.content_free_input) if self.choices else None
@@ -113,6 +107,51 @@ class ProbabilityCalibrator:
             self.p_z = self.compute_p_z(sample_dataset)
         else:
             self.p_z = None
+
+    def _build_sampled_permutations(self):
+        """Build permutation list used in calibration without exploding memory."""
+        if not self.choices or self.num_trials <= 0:
+            return []
+
+        n = len(self.choices)
+        total_perms = math.factorial(n)
+        # Safe threshold to enumerate exactly.
+        max_exact_perms = 50000
+
+        if total_perms <= max_exact_perms:
+            all_perms = list(itertools.permutations(self.choices))
+            if self.num_trials > len(all_perms):
+                logging.warning(
+                    f"num_trials ({self.num_trials}) > unique permutations ({len(all_perms)}); "
+                    f"reducing num_trials to {len(all_perms)}."
+                )
+                self.num_trials = len(all_perms)
+            if self.num_trials == len(all_perms):
+                return all_perms
+            chosen_idx = np.random.choice(len(all_perms), size=self.num_trials, replace=False)
+            return [all_perms[i] for i in chosen_idx]
+
+        logging.info(
+            f"Choice count {n} implies {total_perms} permutations; sampling {self.num_trials} random unique permutations."
+        )
+        rng = np.random.default_rng(42)
+        base = np.array(self.choices, dtype=object)
+        seen = set()
+        perms = []
+        attempts = 0
+        max_attempts = max(self.num_trials * 20, 100)
+        while len(perms) < self.num_trials and attempts < max_attempts:
+            perm = tuple(rng.permutation(base).tolist())
+            if perm not in seen:
+                seen.add(perm)
+                perms.append(perm)
+            attempts += 1
+        if len(perms) < self.num_trials:
+            logging.warning(
+                f"Requested {self.num_trials} unique sampled permutations; got {len(perms)} after {attempts} attempts."
+            )
+            self.num_trials = len(perms)
+        return perms
 
     def _get_log_prob_sums(self, question: str, choices: List[str], batch_prompts: bool = None) -> List[float]:
         """Universal helper that uses the external scorer for the given choices.
@@ -160,15 +199,19 @@ class ProbabilityCalibrator:
 
         Returns: a GPU tensor of shape (len(choices),) with log-probs in the original choice order.
         """
-        if not self.choices or not self.permutations:
+        if not self.choices or not self.sampled_permutations:
             return torch.zeros(len(self.choices) if self.choices else 0, dtype=torch.float)
             
         num_labels = len(self.choices)
         total_probabilities = torch.zeros(num_labels, dtype=torch.float)
 
-        # Sample permutations
-        chosen_perm_indices = np.random.choice(len(self.permutations), size=self.num_trials, replace=False)
-        perm_iterator = tqdm(chosen_perm_indices, desc="Calibrating P(z|X)", unit="perm", leave=False) if self.verbose else chosen_perm_indices
+        perm_iterator = tqdm(
+            self.sampled_permutations,
+            desc="Calibrating P(z|X)",
+            unit="perm",
+            leave=False,
+            disable=not self.verbose
+        ) if self.verbose else self.sampled_permutations
 
         # Process permutations
         if self.batch_permutations:
@@ -178,8 +221,7 @@ class ProbabilityCalibrator:
             all_prompts = []
             all_perm_indices = []
             
-            for i, perm_idx in enumerate(perm_iterator):
-                current_perm = self.permutations[perm_idx]
+            for i, current_perm in enumerate(perm_iterator):
                 prompt = self.format_prompt(question, current_perm)
                 for choice in current_perm:
                     all_prompts.append(prompt)
@@ -215,8 +257,7 @@ class ProbabilityCalibrator:
                     total_probabilities[orig_idx] += perm_probs[i]
         else:
             # Process each permutation separately
-            for perm_idx in perm_iterator:
-                current_perm = self.permutations[perm_idx]
+            for current_perm in perm_iterator:
                 
                 # Get log probs for current permutation
                 prompt = self.format_prompt(question, current_perm)
@@ -263,7 +304,7 @@ class ProbabilityCalibrator:
         
         dataset_iterator = dataset_texts
         if self.verbose:
-            dataset_iterator = tqdm(dataset_texts, desc="Estimating P(z) from dataset", unit="text", leave=False)
+            dataset_iterator = tqdm(dataset_texts, desc="Estimating P(z) from dataset", unit="text", leave=False, disable=not self.verbose)
             
         for X in dataset_iterator:
             cp = self.calibrate_p_z_given_X(X)  # CPU numpy
@@ -303,7 +344,7 @@ class ProbabilityCalibrator:
         
         sample_iterator = texts_sample
         if self.verbose:
-            sample_iterator = tqdm(texts_sample, desc="Calculating P(X) for baseline sample", unit="text", leave=False)
+            sample_iterator = tqdm(texts_sample, desc="Calculating P(X) for baseline sample", unit="text", leave=False, disable=not self.verbose)
             
         for text in sample_iterator:
             log_px_values.append(self.compute_p_X(str(text)))

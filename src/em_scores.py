@@ -43,6 +43,13 @@ def compute_document_level_scores(
         pz = pz / pz.sum() if pz.sum() > 0 else np.ones(len(choices_str)) / len(choices_str)
     else:
         pz = np.array(p_z_prior, dtype=float)
+        if pz.ndim != 1:
+            raise ValueError(f"p_z_prior must be 1D, got shape {pz.shape}.")
+        if len(pz) != len(choices):
+            raise ValueError(
+                f"p_z_prior length ({len(pz)}) does not match number of choices ({len(choices)}). "
+                "This usually means cluster choices changed but calibrator/prior was not refreshed."
+            )
 
     try:
         L_baseline = float(prob_calibrator.compute_average_log_px_from_sample(list(df[text_col].astype(str))))
@@ -57,6 +64,11 @@ def compute_document_level_scores(
         pzx = prob_calibrator.calibrate_p_z_given_X(x)
         posteriors.append(pzx)
     PZX = np.vstack(posteriors)
+    if PZX.shape[1] != len(choices):
+        raise ValueError(
+            f"PZX width ({PZX.shape[1]}) does not match number of choices ({len(choices)}). "
+            "Calibrator choices are out of sync with current schema labels."
+        )
 
     PX_given_Z_norm = np.vstack([bayes_px_given_z_normalized(PZX[i], pz) for i in range(PZX.shape[0])])
     log_PX_given_Z_norm = _safe_log(PX_given_Z_norm)
