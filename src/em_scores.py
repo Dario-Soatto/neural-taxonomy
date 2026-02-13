@@ -9,10 +9,17 @@ def _safe_log(x: np.ndarray, eps: float = 1e-30) -> np.ndarray:
 
 def bayes_px_given_z_normalized(p_z_given_x: np.ndarray, p_z_prior: np.ndarray) -> np.ndarray:
     """
-    p(x|z) ∝ p(z|x) p(z), normalized across z by sum_k p(z_k|x) p(z_k).
+    p(x|z) ∝ p(z|x) / p(z), normalized across z.
+    
+    From Bayes' theorem: P(z|x) = P(x|z) * P(z) / P(x)
+    Solving for P(x|z): P(x|z) = P(z|x) * P(x) / P(z)
+    Since P(x) is constant across z for a given x: P(x|z) ∝ P(z|x) / P(z)
+    
     Returns a K-vector that sums to 1 for each x.
     """
-    numer = p_z_given_x * p_z_prior
+    # Avoid division by zero
+    safe_prior = np.clip(p_z_prior, 1e-10, None)
+    numer = p_z_given_x / safe_prior
     denom = np.sum(numer)
     if denom <= 0:
         return np.ones_like(numer) / len(numer)
