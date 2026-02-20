@@ -274,7 +274,8 @@ def compute_cluster_metrics(
     logging.info("Starting computation of cluster metrics...")
     cluster_metrics = {}
     choice_to_idx = {c: i for i, c in enumerate(choices_list)}
-    if p_z_prior is None:
+    if p_z_prior is None or len(p_z_prior) != len(choices_list):
+        # Recompute prior from current data if not provided or size mismatch (e.g., after cluster add/remove)
         labels_as_str = merged_df['agglomerative_label'].astype(str)
         choices_str = [str(c) for c in choices_list]
         counts = pd.Categorical(labels_as_str, categories=choices_str).value_counts()
