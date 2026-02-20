@@ -11,9 +11,10 @@
 
 set -euo pipefail
 
-REPO_DIR="/nlp/scr/tdalmia/projects/neural-taxonomy"  # Update to your path
-EXPERIMENT_DIR="experiments/wiki_biographies_10000"
-OUTPUT_FILE="experiments/wiki_biographies_10000/em_refined_scores_fast.csv"
+REPO_DIR="/nlp/scr/soatto/neural-taxonomy"
+EXPERIMENT_DIR="/nlp/scr/tdalmia/projects/neural-taxonomy/experiments/wiki_biographies_10000"
+OUTPUT_FILE="/nlp/scr/soatto/neural-taxonomy/em_refined_scores_fast.csv"
+DIAGNOSTICS_DIR="/nlp/scr/soatto/neural-taxonomy/em_diagnostics"
 MODEL_NAME="Qwen/Qwen2.5-1.5B-Instruct"
 
 cd "${REPO_DIR}"
@@ -60,9 +61,12 @@ echo "Model: ${MODEL_NAME}"
 echo "Experiment: ${EXPERIMENT_DIR}"
 echo "========================================"
 
+mkdir -p "${DIAGNOSTICS_DIR}"
+
 python src/run_em_algorithm.py \
   --experiment_dir "${EXPERIMENT_DIR}" \
   --output_file "${OUTPUT_FILE}" \
+  --diagnostics_dir "${DIAGNOSTICS_DIR}" \
   --num_agglomerative_clusters 10 \
   --model_type vllm \
   --model_name "${MODEL_NAME}" \
