@@ -611,7 +611,7 @@ def run_probability_diagnostics(
     _plot_histogram(p_z_prior, f"p(z) prior (iter {iteration_idx})", "p_z", output_dir / f"hist_pz_prior_iter_{iteration_idx:02d}.png", bins=min(bins, len(p_z_prior)))
 
 
-def apply_schema_updates(merged_df: pd.DataFrame, embeddings: np.ndarray, actions: dict, next_new_cluster_id: int) -> tuple[pd.DataFrame, int]:
+def apply_schema_updates(merged_df: pd.DataFrame, embeddings: np.ndarray, idx_to_emb_pos_map: dict, actions: dict, next_new_cluster_id: int) -> tuple[pd.DataFrame, int]:
     """Apply split, merge, remove actions to merged_df and return updated df and next available cluster id."""
     from sklearn.cluster import KMeans
     logging.info(f"Starting to apply schema updates. Initial #clusters: {merged_df['cluster_id'].nunique()}")
@@ -657,7 +657,17 @@ def apply_schema_updates(merged_df: pd.DataFrame, embeddings: np.ndarray, action
             if len(subset_indices) < 2:
                 logging.warning(f"Cluster {cid_to_split} has < 2 items after other ops. Cannot split.")
                 continue
-            emb_subset = embeddings[subset_indices.to_numpy()]
+            # Map DataFrame indices to embedding positions
+            valid_subset_indices = []
+            emb_positions = []
+            for idx in subset_indices:
+                if idx in idx_to_emb_pos_map:
+                    valid_subset_indices.append(idx)
+                    emb_positions.append(idx_to_emb_pos_map[idx])
+            if len(emb_positions) < 2:
+                logging.warning(f"Cluster {cid_to_split} has < 2 valid embeddings. Cannot split.")
+                continue
+            emb_subset = embeddings[emb_positions]
             kmeans = KMeans(n_clusters=2, n_init='auto', random_state=42)
             try:
                 labels_split = kmeans.fit_predict(emb_subset)
@@ -667,7 +677,7 @@ def apply_schema_updates(merged_df: pd.DataFrame, embeddings: np.ndarray, action
             new_split_id = next_new_cluster_id
             next_new_cluster_id += 1
             split_assignment_map = {}
-            for i, original_df_idx in enumerate(subset_indices):
+            for i, original_df_idx in enumerate(valid_subset_indices):
                 if labels_split[i] == 0:
                     split_assignment_map[original_df_idx] = cid_to_split
                 else:
@@ -802,7 +812,7 @@ def em_schema_refinement(
         actions = decide_schema_updates(cluster_metrics, verbose=verbose, log_top_pairs=log_top_pairs)
         iteration_actions.update(actions)
         logging.info(f"Iteration {iter_idx + 1}: Actions decided from metrics (Split/Merge/Remove): {actions}. 'Add' actions to be determined next.")
-        current_merged_df, next_new_cluster_id = apply_schema_updates(current_merged_df, all_embeddings, actions, next_new_cluster_id)
+        current_merged_df, next_new_cluster_id = apply_schema_updates(current_merged_df, all_embeddings, idx_to_emb_pos_map, actions, next_new_cluster_id)
         
         # Log P(z|X) for each datapoint if verbose
         if verbose:
@@ -853,19 +863,32 @@ def em_schema_refinement(
         added_clusters_info = []
         if len(poor_indices) >= min_poorly_explained_for_add:
             logging.info(f"  Found {len(poor_indices)} texts poorly explained (max p(z|x) < {low_confidence_threshold_add}). Attempting to form new clusters.")
-            emb_poor = all_embeddings[poor_indices]
-            num_new_clusters_to_add = max(1, len(poor_indices) // items_per_new_cluster_add)
-            logging.info(f"  Attempting to create {num_new_clusters_to_add} new clusters from these texts.")
-            from sklearn.cluster import KMeans
-            if len(emb_poor) < num_new_clusters_to_add:
-                 logging.warning(f"  Number of poorly explained texts ({len(emb_poor)}) is less than target new clusters ({num_new_clusters_to_add}). Adjusting to {len(emb_poor)} clusters.")
-                 num_new_clusters_to_add = len(emb_poor)
-            if num_new_clusters_to_add > 0:
-                kmeans_poor = KMeans(n_clusters=num_new_clusters_to_add, n_init='auto', random_state=42)
-                try:
-                    new_labels_for_poor_texts = kmeans_poor.fit_predict(emb_poor)
-                    for k_new_cluster in range(num_new_clusters_to_add):
-                        new_cluster_original_indices = [poor_indices[i] for i, lab in enumerate(new_labels_for_poor_texts) if lab == k_new_cluster]
+            # Map original DataFrame indices to embedding positions
+            valid_poor_indices = []
+            poor_emb_positions = []
+            for idx in poor_indices:
+                if idx in idx_to_emb_pos_map:
+                    valid_poor_indices.append(idx)
+                    poor_emb_positions.append(idx_to_emb_pos_map[idx])
+                else:
+                    logging.warning(f"  Original index {idx} not found in idx_to_emb_pos_map. Skipping.")
+            
+            if not poor_emb_positions:
+                logging.warning("  No valid embeddings for poorly explained texts. Skipping add step.")
+            else:
+                emb_poor = all_embeddings[poor_emb_positions]
+                num_new_clusters_to_add = max(1, len(valid_poor_indices) // items_per_new_cluster_add)
+                logging.info(f"  Attempting to create {num_new_clusters_to_add} new clusters from these texts.")
+                from sklearn.cluster import KMeans
+                if len(emb_poor) < num_new_clusters_to_add:
+                     logging.warning(f"  Number of poorly explained texts ({len(emb_poor)}) is less than target new clusters ({num_new_clusters_to_add}). Adjusting to {len(emb_poor)} clusters.")
+                     num_new_clusters_to_add = len(emb_poor)
+                if num_new_clusters_to_add > 0:
+                    kmeans_poor = KMeans(n_clusters=num_new_clusters_to_add, n_init='auto', random_state=42)
+                    try:
+                        new_labels_for_poor_texts = kmeans_poor.fit_predict(emb_poor)
+                        for k_new_cluster in range(num_new_clusters_to_add):
+                            new_cluster_original_indices = [valid_poor_indices[i] for i, lab in enumerate(new_labels_for_poor_texts) if lab == k_new_cluster]
                         if new_cluster_original_indices:
                             assigned_new_id = next_new_cluster_id
                             next_new_cluster_id += 1
@@ -873,10 +896,10 @@ def em_schema_refinement(
                             current_merged_df.loc[new_cluster_original_indices, 'agglomerative_label'] = f"new_cluster_{assigned_new_id}"
                             added_clusters_info.append({'id': assigned_new_id, 'size': len(new_cluster_original_indices)})
                             logging.info(f"    Added new cluster {assigned_new_id} with {len(new_cluster_original_indices)} texts.")
-                except Exception as e:
-                    logging.error(f"  KMeans failed for adding new clusters from poorly explained texts: {e}")
-            else:
-                logging.info("  No new clusters to add based on poor text count or KMeans failure.")
+                    except Exception as e:
+                        logging.error(f"  KMeans failed for adding new clusters from poorly explained texts: {e}")
+                else:
+                    logging.info("  No new clusters to add based on poor text count or KMeans failure.")
         else:
             logging.info(f"  Found {len(poor_indices)} poorly explained texts (threshold: {min_poorly_explained_for_add}). Not adding new clusters based on this criterion.")
         iteration_actions['add'] = added_clusters_info

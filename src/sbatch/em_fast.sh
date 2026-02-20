@@ -76,7 +76,7 @@ python src/run_em_algorithm.py \
   --num_iterations 5 \
   --num_datapoints_per_cluster 50 \
   --baseline_sample_size 200 \
-  --max_texts_per_cluster_metrics 50 \
+  --max_texts_per_cluster_metrics -1 \
   --log_iteration_metrics \
   --show_progress \
   --embedding_model_name sentence-transformers/all-MiniLM-L6-v2 \
