@@ -312,16 +312,29 @@ class ProbabilityCalibrator:
         p_z_gpu = total_probs / len(dataset_texts)
         return p_z_gpu.cpu().numpy()
 
-    def compute_p_X(self, input_text: str) -> float:
-        """Returns the sum of log-probabilities for the entire string via external fn."""
+    def compute_log_p_X(self, input_text: str) -> float:
+        """Returns log p(x): sum of log-probabilities for the entire string."""
         return self.full_logprob_fn(input_text)
 
-    def compute_p_X_given_z(self, p_z_X, p_X, p_z):
+    def compute_p_X(self, input_text: str) -> float:
+        """Deprecated name: returns log p(x), not p(x)."""
+        return self.compute_log_p_X(input_text)
+
+    def compute_log_p_X_given_z(self, log_p_z_given_x: float, log_p_x: float, log_p_z: float) -> float:
         """
-        Bayes' rule in probability space:
-          p(X|z) = (p(z|X) * p(X)) / p(z)
+        Bayes' rule in log space:
+          log p(x|z) = log p(z|x) + log p(x) - log p(z)
         """
-        return (p_z_X * p_X) / p_z
+        return float(log_p_z_given_x) + float(log_p_x) - float(log_p_z)
+
+    def compute_p_X_given_z(self, *args, **kwargs):
+        """
+        Deprecated: use compute_log_p_X_given_z (log space) or em_scores.bayes_log_px_given_z.
+        """
+        raise NotImplementedError(
+            "compute_p_X_given_z is deprecated (log/prob mismatch). "
+            "Use compute_log_p_X_given_z or em_scores.bayes_log_px_given_z."
+        )
 
     def format_prompt(self, text, choices):
         """
@@ -347,7 +360,7 @@ class ProbabilityCalibrator:
             sample_iterator = tqdm(texts_sample, desc="Calculating P(X) for baseline sample", unit="text", leave=False, disable=not self.verbose)
             
         for text in sample_iterator:
-            log_px_values.append(self.compute_p_X(str(text)))
+            log_px_values.append(self.compute_log_p_X(str(text)))
         
         return np.mean(log_px_values) if log_px_values else 0.0
 

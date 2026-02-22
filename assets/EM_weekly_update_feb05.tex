@@ -1,0 +1,188 @@
+\documentclass{beamer}
+\usetheme{Madrid}
+\usecolortheme{seahorse}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\title{EM-Style Schema Refinement: Weekly Update}
+\author{Tushar Dalmia, Dario Soatto}
+\date{Week of February 3--5, 2026}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{This Week at a Glance}
+\begin{itemize}
+  \item Scaled wiki-biographies pipeline from 1K to \textbf{10K input rows}.
+  \item Switched to \textbf{biography-specific prompts} for Step 1/2.
+  \item Added/used EM probability diagnostics (pmax, entropy, top-gap, assigned posterior).
+  \item Fixed EM threshold basis: split/remove decisions now use \(\log p(x \mid z)\)-scale baseline.
+  \item Observed first strong structural EM moves (split/remove/add), exposing a duplicate-label edge case.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Scaling to 10K: Pipeline Configuration}
+\small
+\textbf{From sbatch scripts (\texttt{src/sbatch/*.sh}):}
+\begin{itemize}
+  \item \textbf{Step 1:} \texttt{--end\_idx 10000}, \texttt{--experiment biographies}, \texttt{--window\_size 3}
+  \item \textbf{Step 4:} K-means with \texttt{--ncentroids 100}
+  \item \textbf{Step 6:} agglomerative search up to \texttt{--max\_clusters 10}, EM run at \texttt{Level 2 / 10 clusters}
+\end{itemize}
+
+\textbf{Working-set size at EM level-2 (from logs):}
+\begin{itemize}
+  \item 10 agglomerative clusters, total \(\approx 9{,}664\) labeled points used in EM scoring.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{10-Cluster Composition Before EM Updates}
+\small
+\begin{tabular}{lrr}
+\toprule
+Cluster label & Node ID & Size \\
+\midrule
+Career Milestone & 100 & 1951 \\
+Quotation & 101 & 375 \\
+Customer Testimonial & 102 & 67 \\
+Narrative Description & 103 & 2175 \\
+Action & 104 & 1990 \\
+Background Information & 105 & 2067 \\
+Location & 106 & 489 \\
+Data Evaluation & 107 & 369 \\
+Conclusion & 108 & 178 \\
+Early Reception & 109 & 3 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.4em}
+\footnotesize Source: \texttt{logs/em\_14330012.err} and \texttt{logs/em\_14338338.err}
+\end{frame}
+
+\begin{frame}{New Biography-Specific Prompting}
+\small
+\textbf{Prompt updates in \texttt{src/prompts.py}:}
+\begin{itemize}
+  \item \texttt{BIOGRAPHIES\_INITIAL\_LABELING\_PROMPT}
+  \item \texttt{BIOGRAPHIES\_SIMILARITY\_PROMPT}
+\end{itemize}
+
+\textbf{Design intent:}
+\begin{itemize}
+  \item Shift from editorial rhetoric roles to biography narrative roles.
+  \item Emphasize function labels: early-life context, education, career milestone, contributions, personal life, legacy, metadata/headers.
+  \item Reduce domain mismatch from prior editorial prompts on biography text.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Probability Diagnostics: What Looked Unusual?}
+\small
+\textbf{Sample diagnostics (\texttt{em\_diag\_iter\_01.csv}, \(n=200\)):}
+\begin{itemize}
+  \item \(p_{\max}\): p10/p50/p90 \(= 0.2296 / 0.4692 / 0.7204\)
+  \item Entropy: p10/p50/p90 \(= 0.9268 / 1.5417 / 2.1105\)
+  \item Top1-Top2 gap: p10/p50/p90 \(= 0.0392 / 0.2269 / 0.5683\)
+  \item Assigned-label posterior: mean \(\approx 0.3286\) (often low)
+\end{itemize}
+
+\textbf{Interpretation:}
+\begin{itemize}
+  \item Significant low-confidence tail; many points are weakly explained by current schema.
+  \item Consistent with add-heavy behavior and later split triggers.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Diagnostic Plots (Placeholders for Figures)}
+\small
+\textbf{Optional figure slots:}
+\begin{itemize}
+  \item \texttt{experiments/wiki\_biographies\_10000/hist\_pmax\_iter\_01.png}
+  \item \texttt{experiments/wiki\_biographies\_10000/hist\_entropy\_iter\_01.png}
+\end{itemize}
+
+\vspace{0.5em}
+\begin{columns}
+  \begin{column}{0.48\textwidth}
+    \centering
+    % Replace with preferred plot:
+    \includegraphics[width=\linewidth]{experiments/wiki_biographies_10000/hist_pmax_iter_01.png}
+  \end{column}
+  \begin{column}{0.48\textwidth}
+    \centering
+    % Replace with preferred plot:
+    \includegraphics[width=\linewidth]{experiments/wiki_biographies_10000/hist_entropy_iter_01.png}
+  \end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Key EM Logic Revision: Threshold Basis}
+\small
+\textbf{Before (run \texttt{em\_14330012}):}
+\begin{itemize}
+  \item Split/remove thresholds compared \(L_z\) against \(\log p(x)\)-scale baseline (\(\approx -35\)).
+  \item Result: thresholds too loose in practice for split/remove; no split/remove triggered.
+\end{itemize}
+
+\textbf{After revision (run \texttt{em\_14338338}):}
+\begin{itemize}
+  \item \(L_z\) and decision baseline are aligned on \(\log p(x\mid z)\)-scale
+  \item Decision baseline moved to \(-1.7211\) (from \(-35.1943\) on raw \(\log p(x)\))
+  \item Split/remove thresholds became reachable and were crossed.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Which Structural Moves Triggered?}
+\small
+\begin{tabular}{lcc}
+\toprule
+Action & \texttt{em\_14330012} (Feb 3--4) & \texttt{em\_14338338} (Feb 4) \\
+\midrule
+Split & 0 & 5 \\
+Merge & 0 & 0 \\
+Remove & 0 & 1 \\
+Add & 12 & 11 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.6em}
+\textbf{Details:}
+\begin{itemize}
+  \item Feb 3--4: add-only expansion \(10 \rightarrow 22\) clusters from 627 low-\(p_{\max}\) points.
+  \item Feb 4: split/remove/add all activated; schema expanded \(10 \rightarrow 25\) before crash.
+  \item Merge stayed inactive (pairwise centroid similarities below merge threshold in top candidates).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Resulting Scores and Interpretation}
+\small
+\textbf{Run \texttt{em\_14330012} (completed):}
+\begin{itemize}
+  \item Pre-update: logL \(-5584.16\), AIC \(11188.32\), BIC \(11260.08\), PPL \(1.782\)
+  \item Post-update (after add): logL \(-5064.62\), AIC \(10173.23\), BIC \(10331.11\), PPL \(1.689\)
+  \item ELBO became more negative (\(-27029.23 \rightarrow -35676.88\)); objective tension remains.
+\end{itemize}
+
+\textbf{Run \texttt{em\_14338338}:}
+\begin{itemize}
+  \item Stronger structural actions triggered under new threshold basis.
+  \item Crashed before post-update metrics due duplicate category names after split.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Next Steps (Beyond Duplicate-Label Bug)}
+\small
+\begin{itemize}
+  \item Add \textbf{accept/reject gating} for structural moves using held-out AIC/BIC/ELBO deltas (not just heuristic triggers).
+  \item Introduce \textbf{semantic relabeling for split children} (avoid inherited duplicate names and improve interpretability).
+  \item Add a \textbf{posterior sanity check}: sample items \(x_i\) from a target label \(z_j\) and verify
+  \(p(z_j \mid x_i) > p(z_k \mid x_i)\) for most \(k \neq j\).
+  \item Evaluate stability across hierarchy levels (e.g., 8/10/12 clusters) and multiple random seeds.
+  \item Add per-action ablations: add-only vs split-only vs split+add to isolate which move drives score gains.
+  \item Add post-EM external quality checks (coherence, downstream relabeling accuracy, human spot checks).
+\end{itemize}
+\end{frame}
+
+\end{document}

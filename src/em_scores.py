@@ -7,23 +7,33 @@ from typing import Dict, List
 def _safe_log(x: np.ndarray, eps: float = 1e-30) -> np.ndarray:
     return np.log(np.clip(x, eps, None))
 
-def bayes_px_given_z_normalized(p_z_given_x: np.ndarray, p_z_prior: np.ndarray) -> np.ndarray:
+def bayes_log_px_given_z(
+    p_z_given_x: np.ndarray,
+    log_px: float,
+    p_z_prior: np.ndarray,
+    eps: float = 1e-30,
+) -> np.ndarray:
     """
-    p(x|z) ∝ p(z|x) / p(z), normalized across z.
-    
-    From Bayes' theorem: P(z|x) = P(x|z) * P(z) / P(x)
-    Solving for P(x|z): P(x|z) = P(z|x) * P(x) / P(z)
-    Since P(x) is constant across z for a given x: P(x|z) ∝ P(z|x) / P(z)
-    
-    Returns a K-vector that sums to 1 for each x.
+    Compute log p(x|z) using Bayes' rule:
+      log p(x|z) = log p(z|x) + log p(x) - log p(z)
+    Returns a K-vector of log p(x|z). No normalization across z.
     """
-    # Avoid division by zero
-    safe_prior = np.clip(p_z_prior, 1e-10, None)
-    numer = p_z_given_x / safe_prior
-    denom = np.sum(numer)
+    p_z_given_x = np.clip(p_z_given_x, eps, None)
+    p_z_prior = np.clip(p_z_prior, eps, None)
+    return np.log(p_z_given_x) + float(log_px) - np.log(p_z_prior)
+
+def softmax_over_z_of_log_px_given_z(log_px_given_z: np.ndarray) -> np.ndarray:
+    """
+    Diagnostic-only: turn log p(x|z) into a normalized vector over z.
+    This is NOT p(x|z); it is a relative support across z for a fixed x.
+    """
+    log_px_given_z = np.asarray(log_px_given_z, dtype=float)
+    max_lp = np.max(log_px_given_z)
+    exps = np.exp(log_px_given_z - max_lp)
+    denom = np.sum(exps)
     if denom <= 0:
-        return np.ones_like(numer) / len(numer)
-    return numer / denom
+        return np.ones_like(exps) / len(exps)
+    return exps / denom
 
 def compute_document_level_scores(
     df: pd.DataFrame,
@@ -37,14 +47,20 @@ def compute_document_level_scores(
     """
     Computes:
       - L_baseline: average log p(x)
-      - L_z[j]: average log p(x|z_j) using Bayes-normalized scores
+      - L_z[j]: average log p(x|z_j) using Bayes' rule in log-space
       - C_z[j]: average posterior p(z_j|x)
       - Optional centroids/variances and pairwise centroid cosine similarities
-      - Per-row pmax and argmax under p(x|z)
+      - Per-row pmax (posterior) and argmax under log p(x|z)
     """
+    choices_str = [str(c) for c in choices]
+    if len(set(choices_str)) != len(choices_str):
+        raise ValueError(
+            "Choices passed to compute_document_level_scores must be unique. "
+            "Duplicate labels detected in schema choices."
+        )
+
     if p_z_prior is None:
         labels_as_str = df[cluster_col].astype(str)
-        choices_str = [str(c) for c in choices]
         counts = pd.Categorical(labels_as_str, categories=choices_str).value_counts()
         pz = counts.to_numpy(dtype=float)
         pz = pz / pz.sum() if pz.sum() > 0 else np.ones(len(choices_str)) / len(choices_str)
@@ -58,16 +74,17 @@ def compute_document_level_scores(
                 "This usually means cluster choices changed but calibrator/prior was not refreshed."
             )
 
-    try:
-        L_baseline = float(prob_calibrator.compute_average_log_px_from_sample(list(df[text_col].astype(str))))
-    except AttributeError:
-        try:
-            L_baseline = float(np.mean([prob_calibrator.compute_log_px(x) for x in df[text_col].astype(str)]))
-        except AttributeError:
-            L_baseline = float(np.mean([np.log(max(prob_calibrator.compute_p_X(x), 1e-30)) for x in df[text_col].astype(str)]))
+    if getattr(prob_calibrator, "full_logprob_fn", None) is None:
+        raise ValueError(
+            "ProbabilityCalibrator.full_logprob_fn is required to compute log p(x) "
+            "for Bayes-consistent log p(x|z) scoring."
+        )
+    texts = df[text_col].astype(str).tolist()
+    log_px_values = np.array([float(prob_calibrator.full_logprob_fn(x)) for x in texts], dtype=float)
+    L_baseline = float(np.mean(log_px_values)) if len(log_px_values) else 0.0
 
     posteriors = []
-    for x in df[text_col].astype(str):
+    for x in texts:
         pzx = prob_calibrator.calibrate_p_z_given_X(x)
         posteriors.append(pzx)
     PZX = np.vstack(posteriors)
@@ -77,11 +94,12 @@ def compute_document_level_scores(
             "Calibrator choices are out of sync with current schema labels."
         )
 
-    PX_given_Z_norm = np.vstack([bayes_px_given_z_normalized(PZX[i], pz) for i in range(PZX.shape[0])])
-    log_PX_given_Z_norm = _safe_log(PX_given_Z_norm)
+    log_px_given_z = np.vstack(
+        [bayes_log_px_given_z(PZX[i], log_px_values[i], pz) for i in range(PZX.shape[0])]
+    )
 
-    pmax = PX_given_Z_norm.max(axis=1)
-    z_hat = PX_given_Z_norm.argmax(axis=1)
+    pmax_posterior = PZX.max(axis=1)
+    z_hat = log_px_given_z.argmax(axis=1)
 
     K = len(choices)
     L_z = np.zeros(K)
@@ -95,7 +113,7 @@ def compute_document_level_scores(
     )
     for j in range(K):
         mask = (assigned_idx == j)
-        L_z[j] = log_PX_given_Z_norm[mask, j].mean() if mask.any() else float('-inf')
+        L_z[j] = log_px_given_z[mask, j].mean() if mask.any() else float('-inf')
         C_z[j] = PZX[:, j].mean()
 
     centroids = None
@@ -126,13 +144,13 @@ def compute_document_level_scores(
         "centroids": centroids,
         "variances": variances,
         "pairwise_cos": pairwise_cos,
-        "row_pmax": pmax,
+        "row_pmax_posterior": pmax_posterior,
         "row_z_hat": z_hat,
-        "row_log_px_given_z_norm": log_PX_given_Z_norm,
-        "row_px_given_z_norm": PX_given_Z_norm,
+        "row_log_px_given_z": log_px_given_z,
         "PZX": PZX,
         "pz_prior": pz,
         "row_cluster_idx": assigned_idx,
+        "row_log_px": log_px_values,
     }
 
 def compute_corpus_level_scores(

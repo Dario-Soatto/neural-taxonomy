@@ -154,12 +154,12 @@ def main():
     )
 
     corpus_scores = compute_corpus_level_scores(
-        log_px_given_z_hat=doc_scores["row_log_px_given_z_norm"][np.arange(len(merged_df)), doc_scores["row_z_hat"]],
+        log_px_given_z_hat=doc_scores["row_log_px_given_z"][np.arange(len(merged_df)), doc_scores["row_z_hat"]],
         token_counts=None,
         k_complexity=len(choices_list),
         is_test_mask=None,
         q_ij=doc_scores["PZX"],
-        log_px_given_z=doc_scores["row_log_px_given_z_norm"],
+        log_px_given_z=doc_scores["row_log_px_given_z"],
         log_pz=np.log(np.clip(doc_scores["pz_prior"], 1e-30, None)),
     )
 
@@ -170,7 +170,7 @@ def main():
     print("EM smoke test summary")
     print(f"- sample_size: {len(merged_df)}")
     print(f"- L_baseline: {doc_scores['L_baseline']:.4f}")
-    print(f"- mean pmax: {doc_scores['row_pmax'].mean():.4f}")
+    print(f"- mean pmax (posterior): {doc_scores['row_pmax_posterior'].mean():.4f}")
     print(f"- top L(z): {choices_list[top_idx]} = {lz[top_idx]:.4f}")
     print(f"- bottom L(z): {choices_list[bottom_idx]} = {lz[bottom_idx]:.4f}")
     print(f"- AIC: {corpus_scores['AIC']}")

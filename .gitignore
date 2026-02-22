@@ -65,6 +65,7 @@ processed_data/
 output/
 results/
 *checkpoints/
+experiments/
 experiments/news-discourse/models/news-discourse-sentence-similarity-model
 
 # Logs and temporary files

@@ -54,6 +54,7 @@ from prompts import (
     EDITORIAL_SIMILARITY_PROMPT,
     HATE_SPEECH_SIMILARITY_PROMPT,
     GENERIC_SIMILARITY_PROMPT,
+    BIOGRAPHIES_SIMILARITY_PROMPT,
 )
 
 # Set environment variable
@@ -570,6 +571,17 @@ def load_and_preprocess(input_file, text_col_name, text_col_name_2, debug=False)
     if text_col_name == 'Narrative Function':
         logging.info("Processing Narrative Function column")
         input_df[text_col_name] = input_df[text_col_name].str.split('\n').str.get(0).str.strip()
+
+    # Support Step 1 outputs where label/description live under the response field.
+    if 'response' in input_df.columns:
+        if text_col_name and text_col_name not in input_df.columns:
+            input_df[text_col_name] = input_df['response'].apply(
+                lambda r: r.get(text_col_name) if isinstance(r, dict) else None
+            )
+        if text_col_name_2 and text_col_name_2 not in input_df.columns:
+            input_df[text_col_name_2] = input_df['response'].apply(
+                lambda r: r.get(text_col_name_2) if isinstance(r, dict) else None
+            )
     
     # Always create 'text_col' for downstream processing
     if text_col_name_2:
@@ -602,6 +614,8 @@ def get_prompt_template(prompt_template):
         return NEWS_DISCOURSE_SIMILARITY_PROMPT
     elif prompt_template == 'editorial':
         return EDITORIAL_SIMILARITY_PROMPT
+    elif prompt_template == 'biographies':
+        return BIOGRAPHIES_SIMILARITY_PROMPT
     elif prompt_template == 'hate_speech':
         return HATE_SPEECH_SIMILARITY_PROMPT
     

@@ -2,8 +2,10 @@
 #SBATCH --job-name=em_wiki
 #SBATCH --account=nlp
 #SBATCH --partition=jag-standard
-#SBATCH --nodelist=jagupard29
+#SBATCH --nodelist=jagupard[28-39]
+#SBATCH --exclude=jagupard18,jagupard19,jagupard20
 #SBATCH --gres=gpu:1
+#SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=14-0
@@ -81,18 +83,21 @@ print_mem_snapshot
 
 python src/run_em_algorithm.py \
   --experiment_dir "${EXPERIMENT_DIR}" \
+  --sentence_data_path "${EXPERIMENT_DIR}/models/all_extracted_discourse_with_clusters_and_text.csv" \
   --output_file "${OUTPUT_FILE}" \
   --num_agglomerative_clusters 10 \
+  --num_datapoints_per_cluster 25 \
   --model_type vllm \
   --model_name "${MODEL_NAME}" \
-  --sentence_column_name description \
+  --sentence_column_name sentence_text \
+  --log_sentence_samples 3 \
   --num_trials 3 \
   --scorer_type batch \
-  --num_iterations 1 \
+  --num_iterations 3 \
   --log_iteration_metrics \
-  --embedding_model_name sentence-transformers/all-MiniLM-L6-v2 \
-  --log_top_pairs 10 \
-  --diagnostics_sample_size 200 \
-  --diagnostics_bins 40
+  --log_top_pairs 5 \
+  --diagnostics_sample_size 50 \
+  --embedding_model_name sentence-transformers/all-MiniLM-L6-v2 
+  
 
 print_mem_snapshot
