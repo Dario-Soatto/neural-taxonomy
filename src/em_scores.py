@@ -336,12 +336,12 @@ def compute_corpus_level_scores_variants(
     elbo = float(np.sum(q_ij * (row_log_px_given_z + log_pz[None, :] - log_q)))
     metrics["ELBO"] = elbo
 
-    # Backward-compatible aliases map to oracle variant.
-    metrics["logL_cond_total"] = metrics["logL_total_oracle"]
-    metrics["avg_logL_per_token"] = metrics["avg_logL_per_token_oracle"]
-    metrics["perplexity"] = metrics["perplexity_oracle"]
-    metrics["perplexity_token"] = metrics["perplexity_token_oracle"]
-    metrics["AIC"] = metrics.get("AIC_oracle")
-    metrics["BIC"] = metrics.get("BIC_oracle")
+    # Backward-compatible aliases map to assigned variant.
+    metrics["logL_cond_total"] = metrics["logL_total_assigned"]
+    metrics["avg_logL_per_token"] = metrics["avg_logL_per_token_assigned"]
+    metrics["perplexity"] = metrics["perplexity_assigned"]
+    metrics["perplexity_token"] = metrics["perplexity_token_assigned"]
+    metrics["AIC"] = metrics.get("AIC_assigned")
+    metrics["BIC"] = metrics.get("BIC_assigned")
 
     return metrics
