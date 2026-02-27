@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=em_wiki
+#SBATCH --job-name=em_wiki_grid
 #SBATCH --account=nlp
 #SBATCH --partition=jag-standard
 #SBATCH --nodelist=jagupard[28-39]
@@ -9,16 +9,17 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=14-0
-#SBATCH --output=logs/em_%j.out
-#SBATCH --error=logs/em_%j.err
+#SBATCH --output=logs/em_grid_%j.out
+#SBATCH --error=logs/em_grid_%j.err
 
 set -euo pipefail
 
 REPO_DIR="/nlp/scr/tdalmia/projects/neural-taxonomy"
 EXPERIMENT_DIR="experiments/wiki_biographies_10000"
-OUTPUT_FILE="experiments/wiki_biographies_10000/em_refined_scores_vllm.csv"
 MODEL_NAME="meta-llama/Meta-Llama-3.1-8B-Instruct"
-EM_TUNE_OPERATION="${EM_TUNE_OPERATION:-all}"
+EM_GRID_OPERATION="${EM_GRID_OPERATION:-add}"
+EM_GRID_PROFILE="${EM_GRID_PROFILE:-coarse}"
+EM_GRID_OUTPUT_ROOT="${EM_GRID_OUTPUT_ROOT:-${EXPERIMENT_DIR}/em_grid_search}"
 
 cd "${REPO_DIR}"
 mkdir -p logs
@@ -58,34 +59,13 @@ export VLLM_MAX_MODEL_LEN=4096
 source /nlp/scr/tdalmia/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
 
-print_mem_snapshot() {
-  echo "===== $(date '+%Y-%m-%d %H:%M:%S') memory snapshot ====="
-  echo "-- Host memory --"
-  free -h || true
-  echo "-- GPU memory --"
-  nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits || true
-  echo "=============================================="
-}
-
-# Periodic memory snapshots for OOM diagnosis.
-(
-  while true; do
-    print_mem_snapshot
-    sleep 120
-  done
-) &
-MEM_MONITOR_PID=$!
-cleanup() {
-  kill "${MEM_MONITOR_PID}" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-print_mem_snapshot
-
-python src/run_em_algorithm.py \
+python src/em_threshold_grid_search.py \
+  --operation "${EM_GRID_OPERATION}" \
+  --grid_profile "${EM_GRID_PROFILE}" \
+  --output_root "${EM_GRID_OUTPUT_ROOT}/${EM_GRID_OPERATION}_${EM_GRID_PROFILE}" \
+  -- \
   --experiment_dir "${EXPERIMENT_DIR}" \
   --sentence_data_path "${EXPERIMENT_DIR}/models/all_extracted_discourse_with_clusters_and_text.csv" \
-  --output_file "${OUTPUT_FILE}" \
   --num_agglomerative_clusters 10 \
   --num_datapoints_per_cluster 50 \
   --subsample_seed 13 \
@@ -95,8 +75,7 @@ python src/run_em_algorithm.py \
   --log_sentence_samples 3 \
   --num_trials 3 \
   --scorer_type batch \
-  --num_iterations 3 \
-  --tune_operation "${EM_TUNE_OPERATION}" \
+  --num_iterations 5 \
   --split_max_per_iter 0 \
   --split_cooldown_iters 0 \
   --merge_max_per_iter 0 \
@@ -106,9 +85,6 @@ python src/run_em_algorithm.py \
   --add_max_new_clusters_per_iter 50 \
   --add_cooldown_iters 0 \
   --noop_patience 1 \
-  --log_iteration_metrics \
   --log_top_pairs 5 \
   --diagnostics_sample_size 50 \
   --embedding_model_name sentence-transformers/all-MiniLM-L6-v2
-
-print_mem_snapshot

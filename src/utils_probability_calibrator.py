@@ -82,7 +82,9 @@ class ProbabilityCalibrator:
         alpha: float = 0.7,
         verbose: bool = False,
         batch_prompts: bool = False,
-        batch_permutations: bool = True
+        batch_permutations: bool = True,
+        vllm_model=None,
+        vllm_tokenizer=None,
     ):
         self.choices = choices
         self.num_trials = num_trials
@@ -93,6 +95,9 @@ class ProbabilityCalibrator:
         self.full_logprob_fn = full_logprob_fn
         self.batch_prompts = batch_prompts
         self.batch_permutations = batch_permutations
+        # Optional handles to reuse an already-loaded vLLM engine/tokenizer.
+        self.vllm_model = vllm_model
+        self.vllm_tokenizer = vllm_tokenizer
 
         # Build a manageable permutation pool without materializing N! for large N.
         self.sampled_permutations = self._build_sampled_permutations()
@@ -399,6 +404,7 @@ def initialize_probability_calibrator(
 
     logprob_scorer_fn = None
     full_logprob_fn = None
+    backend_tokenizer = None
 
     if model_type == "hf":
         logging.info(f"Loading Hugging Face model: {model_identifier} for ProbabilityCalibrator setup.")
@@ -419,6 +425,7 @@ def initialize_probability_calibrator(
 
         single_fn, batch_fn, full_logprob_fn = build_hf_logprob_fns(model_instance, tokenizer_instance)
         logprob_scorer_fn = batch_fn if scorer_type == "batch" else single_fn
+        backend_tokenizer = tokenizer_instance
 
     elif model_type == "together":
         logging.info(f"Preparing TogetherAI model ({model_identifier}) for ProbabilityCalibrator setup.")
@@ -436,6 +443,11 @@ def initialize_probability_calibrator(
     if logprob_scorer_fn is None or full_logprob_fn is None:
         raise RuntimeError(f"Failed to obtain scorer functions for model_type '{model_type}'.")
 
+    vllm_model = getattr(logprob_scorer_fn, "_vllm_llm", None)
+    vllm_tokenizer = getattr(logprob_scorer_fn, "_vllm_tokenizer", None)
+    if backend_tokenizer is None:
+        backend_tokenizer = vllm_tokenizer
+
     prob_calibrator = ProbabilityCalibrator(
         choices=choices,
         logprob_scorer=logprob_scorer_fn,
@@ -443,8 +455,12 @@ def initialize_probability_calibrator(
         num_trials=num_trials,
         verbose=verbose,
         batch_prompts=batch_prompts,
-        batch_permutations=batch_permutations
+        batch_permutations=batch_permutations,
+        vllm_model=vllm_model,
+        vllm_tokenizer=vllm_tokenizer,
     )
+    if backend_tokenizer is not None:
+        setattr(prob_calibrator, "tokenizer", backend_tokenizer)
     return prob_calibrator
 
 

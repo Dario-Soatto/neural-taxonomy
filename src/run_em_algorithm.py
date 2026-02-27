@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
+import re
 from pathlib import Path
 import sys
 from tqdm import tqdm
@@ -24,34 +25,64 @@ from schema_utils import (
 )
 
 # --- EM Refinement Constants ---
-# For decide_schema_updates
-SIMILARITY_THRESHOLD_MERGE = 0.8  # Cosine similarity for merging cluster centroids
-MIN_CLUSTER_SIZE_REMOVE = 5     # Minimum number of items for a cluster to be kept
-BASELINE_LL_FACTOR_REMOVE = 1.01 # Factor for L_z vs L_baseline for removal (L_z < L_baseline * FACTOR)
-BASELINE_LL_FACTOR_SPLIT = 0.9   # Factor for L_z vs L_baseline for splitting (L_z < L_baseline * FACTOR)
-CONFIDENCE_THRESHOLD_SPLIT = 0.4 # Minimum posterior confidence C(z) for splitting
-# For em_schema_refinement (Add step)
-LOW_CONFIDENCE_THRESHOLD_ADD = 0.2 # Max p(z|x) for a text to be considered poorly explained
-MIN_POORLY_EXPLAINED_FOR_ADD = 5  # Min number of poorly explained texts to trigger new cluster formation
-ITEMS_PER_NEW_CLUSTER_ADD = 50   # Heuristic: 1 new cluster per this many poorly explained items
-MAX_NEW_CLUSTERS_PER_ITER = 3    # Hard cap to prevent avalanche
-MAX_TOTAL_CLUSTERS = 200         # Hard cap on total clusters
-MIN_DIVERSE_GROUPS_ADD = 2       # Require at least this many coherent groups before adding
-MIN_GROUP_SIZE_ADD = 5           # Min size per new cluster group
-ENTROPY_THRESHOLD_ADD = 1.0      # Require posterior entropy above this to add
+VALID_TUNE_OPERATIONS = ("all", "split", "merge", "remove", "add", "revise")
 DUP_LABEL_SIM_THRESHOLD = 0.90   # Near-duplicate label similarity threshold
-ADD_COHESION_THRESHOLD = 0.20    # Min avg cosine similarity within new group
 
 
 @dataclass
 class SchemaRefinementConfig:
-    enable_splits: bool = False
-    max_splits_per_iter: int = 1
-    min_cluster_size_for_split: int = 20
-    split_L_margin: float = 8.0
-    split_C_thresh: float = 0.20
-    min_gap_median_for_split: float = 0.15
-    cooldown_iters_after_split: int = 1
+    tune_operation: str = "all"
+
+    split_enabled: bool = True
+    split_max_per_iter: int = 1
+    split_min_cluster_size: int = 20
+    split_ll_margin: float = 6.0
+    split_confidence_max: float = 0.30
+    split_gap_median_min: float = 0.10
+    split_min_conditions: int = 1
+    split_cooldown_iters: int = 1
+
+    merge_enabled: bool = True
+    merge_max_per_iter: int = 1
+    merge_similarity_min: float = 0.80
+    merge_l_diff_ratio_max: float = 0.10
+    merge_c_diff_ratio_max: float = 0.10
+    merge_min_conditions: int = 1
+
+    remove_enabled: bool = True
+    remove_max_per_iter: int = 0
+    remove_min_cluster_size: int = 5
+    remove_ll_factor: float = 1.01
+
+    revise_enabled: bool = True
+    revise_max_per_iter: int = 1
+    revise_ll_margin: float = 4.0
+    revise_confidence_max: float = 0.25
+    revise_min_conditions: int = 1
+    revise_cooldown_iters: int = 1
+
+    add_enabled: bool = True
+    add_low_confidence_max: float = 0.2
+    add_low_confidence_quantile: float = 0.05
+    add_min_poorly_explained: int = 5
+    add_items_per_new_cluster: int = 50
+    add_max_new_clusters_per_iter: int = 3
+    add_max_total_clusters: int = 200
+    add_min_group_size: int = 4
+    add_entropy_min: float = 0.9
+    add_cohesion_min: float = 0.15
+    add_cooldown_iters: int = 1
+
+    rollback_on_metric_degrade: bool = True
+    accept_min_delta: float = 0.0
+    noop_patience: int = 2
+
+    def operation_enabled(self, operation_name: str) -> bool:
+        if operation_name not in {"split", "merge", "remove", "add", "revise"}:
+            raise ValueError(f"Unsupported operation name: {operation_name}")
+        if self.tune_operation != "all" and self.tune_operation != operation_name:
+            return False
+        return bool(getattr(self, f"{operation_name}_enabled"))
 
 DEFAULT_BASELINE_SAMPLE_SIZE = 500 # Default sample size for baseline P(x) calculation
 DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS = -1 # Default max texts per cluster for metrics; -1 means no limit
@@ -73,7 +104,7 @@ def rebuild_calibrator_with_existing_backend(
     Rebuild a calibrator with new choices while reusing the existing scorer functions.
     This avoids reloading the underlying model (important for vLLM GPU memory).
     """
-    return ProbabilityCalibrator(
+    rebuilt = ProbabilityCalibrator(
         choices=new_choices,
         logprob_scorer=existing_calibrator.logprob_scorer,
         full_logprob_fn=existing_calibrator.full_logprob_fn,
@@ -83,7 +114,14 @@ def rebuild_calibrator_with_existing_backend(
         verbose=verbose,
         batch_prompts=existing_calibrator.batch_prompts,
         batch_permutations=existing_calibrator.batch_permutations,
+        vllm_model=getattr(existing_calibrator, "vllm_model", None),
+        vllm_tokenizer=getattr(existing_calibrator, "vllm_tokenizer", None),
     )
+    # Preserve tokenizer handle for token-count-aware metrics when available.
+    existing_tokenizer = getattr(existing_calibrator, "tokenizer", None)
+    if existing_tokenizer is not None:
+        setattr(rebuilt, "tokenizer", existing_tokenizer)
+    return rebuilt
 
 
 def setup_logging():
@@ -292,6 +330,29 @@ def compute_sentence_embeddings(texts: list[str], model_name: str = "sentence-tr
     return embeddings
 
 
+def estimate_token_counts(
+    texts: list[str],
+    tokenizer=None,
+) -> np.ndarray:
+    """
+    Estimate token counts per text. Uses model tokenizer when available,
+    otherwise falls back to whitespace token counts.
+    """
+    counts: list[float] = []
+    use_model_tokenizer = tokenizer is not None and hasattr(tokenizer, "encode")
+    for txt in texts:
+        t = str(txt)
+        if use_model_tokenizer:
+            try:
+                n_tokens = len(tokenizer.encode(t, add_special_tokens=False))
+            except Exception:
+                n_tokens = len(t.split())
+        else:
+            n_tokens = len(t.split())
+        counts.append(float(max(1, n_tokens)))
+    return np.array(counts, dtype=float)
+
+
 def score_dataframe_sentences(calibrator: ProbabilityCalibrator, data_df: pd.DataFrame, text_column: str, choices_list_for_output: list[str], show_progress: bool = False) -> pd.DataFrame:
     """Scores sentences in the DataFrame using the provided calibrator."""
     logging.info(f"Scoring sentences from column: '{text_column}'...")
@@ -468,13 +529,18 @@ def decide_schema_updates(
     cluster_metrics: dict,
     config: SchemaRefinementConfig,
     split_cooldown: dict[int, int],
+    revise_cooldown: dict[int, int],
     iter_idx: int,
     verbose: bool = False,
     log_top_pairs: int = 0,
 ):
     """Determine which clusters to split, merge, remove. Returns dictionaries describing actions."""
     logging.info("Starting schema update decisions...")
-    actions = {'split': [], 'merge': [], 'remove': []}
+    actions = {'split': [], 'merge': [], 'remove': [], 'revise': []}
+    split_enabled = config.operation_enabled("split")
+    merge_enabled = config.operation_enabled("merge")
+    remove_enabled = config.operation_enabled("remove")
+    revise_enabled = config.operation_enabled("revise")
     # Extract baseline and actual cluster data separately
     baseline_log_px = cluster_metrics.pop('_baseline_log_px', 0.0)
     baseline_log_pxz_assigned = cluster_metrics.pop('_baseline_log_pxz_assigned', baseline_log_px)
@@ -488,10 +554,36 @@ def decide_schema_updates(
 
     median_V_z = np.median([cluster_metrics[cid]['V_z'] for cid in valid_cluster_ids if 'V_z' in cluster_metrics[cid]])
     logging.info(
-        f"Using decision baseline L_baseline_assigned={decision_baseline:.4f} (and log p(x) baseline={baseline_log_px:.4f}), Median V_z={median_V_z:.4f} for decisions. "
-        f"Thresholds: remove if size<{MIN_CLUSTER_SIZE_REMOVE} and L_z<{decision_baseline * BASELINE_LL_FACTOR_REMOVE:.4f}; "
-        f"split if enabled (gated by size, L_z margin, C_z, gap_median, cooldown). "
-        f"merge if cosine_sim>={SIMILARITY_THRESHOLD_MERGE:.2f}."
+        "Using decision baseline L_baseline_assigned=%.4f (and log p(x) baseline=%.4f), Median V_z=%.4f. "
+        "tune_operation=%s; enabled ops: split=%s merge=%s remove=%s revise=%s. "
+        "remove: size<%s and L_z<%.4f. "
+        "split: size>=%s, min_conditions=%s over [L_z<%.4f, C_z<%.4f, gap_median>=%.4f], cooldown=%s. "
+        "merge: min_conditions=%s over [cosine_sim>=%.2f, L_ratio<=%.3f, C_ratio<=%.3f]. "
+        "revise: min_conditions=%s over [L_z<%.4f, C_z<%.4f], cooldown=%s.",
+        decision_baseline,
+        baseline_log_px,
+        median_V_z,
+        config.tune_operation,
+        split_enabled,
+        merge_enabled,
+        remove_enabled,
+        revise_enabled,
+        config.remove_min_cluster_size,
+        decision_baseline * config.remove_ll_factor,
+        config.split_min_cluster_size,
+        config.split_min_conditions,
+        decision_baseline - config.split_ll_margin,
+        config.split_confidence_max,
+        config.split_gap_median_min,
+        config.split_cooldown_iters,
+        config.merge_min_conditions,
+        config.merge_similarity_min,
+        config.merge_l_diff_ratio_max,
+        config.merge_c_diff_ratio_max,
+        config.revise_min_conditions,
+        decision_baseline - config.revise_ll_margin,
+        config.revise_confidence_max,
+        config.revise_cooldown_iters,
     )
 
     # Track margins to understand how close we are to thresholds
@@ -503,41 +595,62 @@ def decide_schema_updates(
         m = cluster_metrics[cid]
         # Per-cluster threshold diagnostics
         logging.info(
-            f"Cluster {cid} ('{m.get('label','N/A')}'): "
-            f"L_z={m['L_z']:.4f}, C_z={m['C_z']:.4f}, V_z={m['V_z']:.4f}, size={m['size']}. "
-            f"remove_thresh={decision_baseline * BASELINE_LL_FACTOR_REMOVE:.4f}, "
-            f"split_thresh={decision_baseline * BASELINE_LL_FACTOR_SPLIT:.4f}"
+            "Cluster %s ('%s'): L_z=%.4f, C_z=%.4f, V_z=%.4f, size=%s. remove_thresh=%.4f, split_thresh=%.4f",
+            cid,
+            m.get('label', 'N/A'),
+            m['L_z'],
+            m['C_z'],
+            m['V_z'],
+            m['size'],
+            decision_baseline * config.remove_ll_factor,
+            decision_baseline - config.split_ll_margin,
         )
         # Removal Check
-        if m['size'] < MIN_CLUSTER_SIZE_REMOVE and m['L_z'] < decision_baseline * BASELINE_LL_FACTOR_REMOVE:
+        if (
+            remove_enabled
+            and m['size'] < config.remove_min_cluster_size
+            and m['L_z'] < decision_baseline * config.remove_ll_factor
+        ):
             actions['remove'].append(cid)
-            logging.info(f"  Suggest REMOVE for cluster {cid} ('{m.get('label', 'N/A')}'): size {m['size']} < {MIN_CLUSTER_SIZE_REMOVE} AND L_z {m['L_z']:.4f} < baseline_thresh {decision_baseline * BASELINE_LL_FACTOR_REMOVE:.4f}.")
+            logging.info(
+                "  Suggest REMOVE for cluster %s ('%s'): size %s < %s AND L_z %.4f < baseline_thresh %.4f.",
+                cid,
+                m.get('label', 'N/A'),
+                m['size'],
+                config.remove_min_cluster_size,
+                m['L_z'],
+                decision_baseline * config.remove_ll_factor,
+            )
             continue # If removed, don't consider for split
-        remove_margins.append(m['L_z'] - (decision_baseline * BASELINE_LL_FACTOR_REMOVE))
+        remove_margins.append(m['L_z'] - (decision_baseline * config.remove_ll_factor))
         # Split Check (gated)
-        if config.enable_splits:
+        if split_enabled:
             cooldown_until = split_cooldown.get(cid)
             in_cooldown = cooldown_until is not None and iter_idx <= cooldown_until
+            split_conditions = [
+                m['L_z'] < (decision_baseline - config.split_ll_margin),
+                m['C_z'] < config.split_confidence_max,
+                m.get('gap_median', 0.0) >= config.split_gap_median_min,
+            ]
             if (
                 (not in_cooldown)
-                and m['size'] >= config.min_cluster_size_for_split
-                and m['L_z'] < (decision_baseline - config.split_L_margin)
-                and m['C_z'] < config.split_C_thresh
-                and m.get('gap_median', 0.0) >= config.min_gap_median_for_split
+                and m['size'] >= config.split_min_cluster_size
+                and int(sum(bool(x) for x in split_conditions)) >= max(1, int(config.split_min_conditions))
             ):
                 actions['split'].append(cid)
                 logging.info(
                     f"  Suggest SPLIT for cluster {cid} ('{m.get('label', 'N/A')}'): "
-                    f"L_z {m['L_z']:.4f} < {decision_baseline - config.split_L_margin:.4f}, "
-                    f"C_z {m['C_z']:.4f} < {config.split_C_thresh}, "
-                    f"gap_median {m.get('gap_median', 0.0):.4f} >= {config.min_gap_median_for_split:.4f}."
+                    f"passed {sum(bool(x) for x in split_conditions)}/{len(split_conditions)} split conditions."
                 )
-        split_margins.append(m['L_z'] - (decision_baseline * BASELINE_LL_FACTOR_SPLIT))
+        split_margins.append(m['L_z'] - (decision_baseline - config.split_ll_margin))
 
     # --- MERGE ---
+    top_pairs = []
     # Filter out clusters already marked for removal or split before considering for merge
     eligible_for_merge_ids = [cid for cid in valid_cluster_ids if cid not in actions['remove'] and cid not in actions['split']]
-    if len(eligible_for_merge_ids) < 2:
+    if not merge_enabled:
+        logging.info("Merge operation disabled for this run.")
+    elif len(eligible_for_merge_ids) < 2:
         logging.info("Not enough eligible clusters to consider merging.")
     else:
         centroids = np.stack([cluster_metrics[cid]['embedding_centroid'] for cid in eligible_for_merge_ids])
@@ -546,7 +659,6 @@ def decide_schema_updates(
         sim_matrix = cent_norm @ cent_norm.T
         n = len(eligible_for_merge_ids)
         merged_already = set()
-        top_pairs = []
         for i in range(n):
             if eligible_for_merge_ids[i] in merged_already:
                 continue
@@ -560,22 +672,75 @@ def decide_schema_updates(
                 sim_val = sim_matrix[i, j]
                 if log_top_pairs > 0:
                     top_pairs.append((sim_val, id_i, id_j))
-                if sim_val >= SIMILARITY_THRESHOLD_MERGE:
-                    m_i = cluster_metrics[id_i]
-                    m_j = cluster_metrics[id_j]
-                    diff_L = abs(m_i['L_z'] - m_j['L_z'])
-                    diff_C = abs(m_i['C_z'] - m_j['C_z'])
-                    # Heuristic: check if L and C are 'similar enough' (e.g. within 10% of each other or small absolute diff)
-                    if diff_L < 0.1 * max(abs(m_i['L_z']), abs(m_j['L_z']), 0.1) and \
-                       diff_C < 0.1 * max(m_i['C_z'], m_j['C_z'], 0.1):
-                        actions['merge'].append(tuple(sorted((id_i, id_j)))) # Store sorted tuple to avoid duplicates like (B,A) if (A,B) decided
-                        merged_already.add(id_i)
-                        merged_already.add(id_j)
-                        logging.info(f"  Suggest MERGE for clusters {id_i} ('{m_i.get('label', 'N/A')}') and {id_j} ('{m_j.get('label', 'N/A')}'): Similarity {sim_val:.4f} >= {SIMILARITY_THRESHOLD_MERGE}, L_diff {diff_L:.4f}, C_diff {diff_C:.4f}.")
-                        break # Merge id_i with one cluster, then move to next i
+                m_i = cluster_metrics[id_i]
+                m_j = cluster_metrics[id_j]
+                diff_L = abs(m_i['L_z'] - m_j['L_z'])
+                diff_C = abs(m_i['C_z'] - m_j['C_z'])
+                diff_L_ratio = diff_L / max(abs(m_i['L_z']), abs(m_j['L_z']), 1e-8)
+                diff_C_ratio = diff_C / max(m_i['C_z'], m_j['C_z'], 1e-8)
+                merge_conditions = [
+                    sim_val >= config.merge_similarity_min,
+                    diff_L_ratio <= config.merge_l_diff_ratio_max,
+                    diff_C_ratio <= config.merge_c_diff_ratio_max,
+                ]
+                if (
+                    int(sum(bool(x) for x in merge_conditions)) >= max(1, int(config.merge_min_conditions))
+                ):
+                    actions['merge'].append(tuple(sorted((id_i, id_j)))) # Store sorted tuple to avoid duplicates like (B,A) if (A,B) decided
+                    merged_already.add(id_i)
+                    merged_already.add(id_j)
+                    logging.info(
+                        "  Suggest MERGE for clusters %s ('%s') and %s ('%s'): "
+                        "passed %s/%s merge conditions (sim=%.4f, L_diff_ratio=%.4f, C_diff_ratio=%.4f).",
+                        id_i,
+                        m_i.get('label', 'N/A'),
+                        id_j,
+                        m_j.get('label', 'N/A'),
+                        sum(bool(x) for x in merge_conditions),
+                        len(merge_conditions),
+                        sim_val,
+                        diff_L_ratio,
+                        diff_C_ratio,
+                    )
+                    break # Merge id_i with one cluster, then move to next i
     
     # Deduplicate merge pairs (if (A,B) and (B,A) somehow got in)
     actions['merge'] = sorted(list(set(actions['merge'])))
+    if config.merge_max_per_iter > 0:
+        actions['merge'] = actions['merge'][:config.merge_max_per_iter]
+    if config.remove_max_per_iter > 0 and actions['remove']:
+        actions['remove'] = sorted(actions['remove'], key=lambda cid: cluster_metrics[cid]['L_z'])[:config.remove_max_per_iter]
+
+    # --- REVISE ---
+    merged_ids = {cid for pair in actions['merge'] for cid in pair}
+    eligible_for_revise = [
+        cid for cid in valid_cluster_ids
+        if cid not in actions['remove'] and cid not in actions['split'] and cid not in merged_ids
+    ]
+    if not revise_enabled:
+        logging.info("Revise operation disabled for this run.")
+    elif not eligible_for_revise:
+        logging.info("No eligible clusters to revise.")
+    else:
+        for cid in eligible_for_revise:
+            m = cluster_metrics[cid]
+            cooldown_until = revise_cooldown.get(cid)
+            in_cooldown = cooldown_until is not None and iter_idx <= cooldown_until
+            revise_conditions = [
+                m['L_z'] < (decision_baseline - config.revise_ll_margin),
+                m['C_z'] < config.revise_confidence_max,
+            ]
+            if (not in_cooldown) and int(sum(bool(x) for x in revise_conditions)) >= max(1, int(config.revise_min_conditions)):
+                actions['revise'].append(cid)
+                logging.info(
+                    "  Suggest REVISE for cluster %s ('%s'): passed %s/%s revise conditions.",
+                    cid,
+                    m.get('label', 'N/A'),
+                    sum(bool(x) for x in revise_conditions),
+                    len(revise_conditions),
+                )
+    if config.revise_max_per_iter > 0 and actions['revise']:
+        actions['revise'] = sorted(actions['revise'], key=lambda cid: cluster_metrics[cid]['L_z'])[:config.revise_max_per_iter]
     if verbose:
         if remove_margins:
             logging.info(f"Remove margin (L_z - remove_thresh) min/median/max: "
@@ -596,11 +761,19 @@ def decide_schema_updates(
                 f"L_diff={diff_L:.4f} C_diff={diff_C:.4f} "
                 f"labels=('{m_i.get('label','N/A')}', '{m_j.get('label','N/A')}')"
             )
-    logging.info(f"Finished schema update decisions. Actions: {actions}")
-    if config.enable_splits and actions['split']:
-        actions['split'] = sorted(actions['split'], key=lambda cid: cluster_metrics[cid]['L_z'])[: config.max_splits_per_iter]
+    if split_enabled and actions['split']:
+        actions['split'] = sorted(actions['split'], key=lambda cid: cluster_metrics[cid]['L_z'])
+        if config.split_max_per_iter > 0:
+            actions['split'] = actions['split'][:config.split_max_per_iter]
     else:
         actions['split'] = []
+    if not merge_enabled:
+        actions['merge'] = []
+    if not remove_enabled:
+        actions['remove'] = []
+    if not revise_enabled:
+        actions['revise'] = []
+    logging.info(f"Finished schema update decisions. Actions: {actions}")
 
     return actions
 
@@ -635,15 +808,228 @@ def _canonical_label_key(label: str) -> str:
     return s
 
 
-def _label_cluster_vllm(texts: list[str], model_name: str) -> tuple[str, str, list[str]] | None:
+def _sample_texts_for_labeling(texts: list[str], max_texts: int = 10, seed: int = 42) -> list[str]:
+    cleaned = [t.replace("\n", " ").strip() for t in texts if t and str(t).strip()]
+    if len(cleaned) <= max_texts:
+        return cleaned
+    rng = np.random.default_rng(seed + len(cleaned))
+    idx = rng.choice(len(cleaned), size=max_texts, replace=False)
+    idx = np.sort(idx)
+    return [cleaned[i] for i in idx]
+
+
+def _fallback_distinct_label_from_texts(
+    texts: list[str],
+    banned_names: list[str] | None = None,
+) -> str | None:
+    banned_keys = {_canonical_label_key(x) for x in (banned_names or []) if sanitize_text(x)}
+    banned_keys.update({"topic", "misc", "subtopic", "variant"})
+
+    for k in (4, 6, 8):
+        name, keywords = propose_label_and_keywords_from_texts(texts, parent_label=None, max_keywords=k)
+        candidate = build_label_string(name, keywords)
+        if _canonical_label_key(candidate) not in banned_keys:
+            return candidate
+
+    # Last semantic fallback: build a name from top keywords directly.
+    _, keywords = propose_label_and_keywords_from_texts(texts, parent_label=None, max_keywords=8)
+    if keywords:
+        name = " ".join(keywords[:2]) if len(keywords) >= 2 else keywords[0]
+        candidate = build_label_string(name, keywords[2:8])
+        if _canonical_label_key(candidate) not in banned_keys:
+            return candidate
+    return None
+
+
+def _label_cluster_vllm(
+    texts: list[str],
+    model_name: str,
+    tokenizer=None,
+    model=None,
+    contrast_texts: list[str] | None = None,
+    parent_label: str | None = None,
+    banned_names: list[str] | None = None,
+    context: str | None = None,
+    max_attempts: int = 4,
+) -> tuple[str, str, list[str]] | None:
     """
     Label a cluster using vLLM. Returns (name, description, keywords).
     """
     try:
-        from utils_vllm_client import load_model as load_vllm_model
+        from utils_vllm_client import robust_parse_outputs
         from vllm import SamplingParams
     except Exception:
         return None
+
+    examples = [t.replace("\n", " ").strip() for t in texts if t][:8]
+    if not examples:
+        return None
+
+    banned_name_keys = {
+        _canonical_label_key(base_label(x))
+        for x in (banned_names or [])
+        if base_label(x)
+    }
+    parent_label = base_label(parent_label) if parent_label else None
+    contrast_examples = [t.replace("\n", " ").strip() for t in (contrast_texts or []) if t][:8]
+
+    try:
+        if tokenizer is None or model is None:
+            from utils_vllm_client import load_model as load_vllm_model
+
+            tokenizer, model = load_vllm_model(model_name)
+    except Exception as exc:
+        logging.warning("vLLM cluster labeling model load failed%s: %s", f" ({context})" if context else "", exc)
+        return None
+
+    generic_tokens = ("subtopic", "variant", "topic", "misc", "other")
+    rejection_reasons: list[str] = []
+    dynamic_banned_keys = set(banned_name_keys)
+
+    for attempt in range(1, max(1, max_attempts) + 1):
+        # Slightly increase temperature on retries to escape repetitive generic names.
+        attempt_temp = min(0.45, 0.10 + 0.10 * (attempt - 1))
+        sampling_params = SamplingParams(temperature=attempt_temp, top_p=0.90, max_tokens=220)
+
+        guidance_lines = [
+            "Produce a semantically specific, standalone cluster label.",
+            "Avoid generic labels such as Subtopic, Variant, Topic, Misc, Other.",
+            "Name must be 2-5 words and should describe discourse function, not entities.",
+            "Return ONLY valid JSON (no markdown, no preamble).",
+        ]
+        if parent_label:
+            guidance_lines.append(f"Parent context label: '{parent_label}'.")
+        if contrast_examples:
+            guidance_lines.append("Ensure the name is distinct from the contrast cluster examples.")
+        if dynamic_banned_keys:
+            banned_list = ", ".join(sorted(dynamic_banned_keys))
+            guidance_lines.append(f"Do NOT use any name equal to or derived from: {banned_list}.")
+
+        prompt = (
+            "Given these example sentences, generate a cluster label.\n\n"
+            "Output schema (exact keys):\n"
+            '{"name":"<2-5 words>","description":"<one sentence>","keywords":["k1","k2"]}\n\n'
+            "Rules:\n- " + "\n- ".join(guidance_lines) + "\n\n"
+            "Target cluster examples:\n- " + "\n- ".join(examples)
+        )
+        if contrast_examples:
+            prompt += "\n\nContrast cluster examples:\n- " + "\n- ".join(contrast_examples)
+
+        prompt_dict = [
+            {"role": "system", "content": "You are an experienced analyst."},
+            {"role": "user", "content": prompt},
+        ]
+        formatted_prompt = tokenizer.apply_chat_template(prompt_dict, tokenize=False, add_generation_prompt=True)
+
+        try:
+            outputs = model.generate([formatted_prompt], sampling_params=sampling_params, use_tqdm=False)
+        except Exception as exc:
+            rejection_reasons.append(f"attempt={attempt}:generate_error={exc}")
+            continue
+
+        raw_text = outputs[0].outputs[0].text if outputs and outputs[0].outputs else ""
+        if not raw_text:
+            rejection_reasons.append(f"attempt={attempt}:empty_output")
+            continue
+
+        data = robust_parse_outputs(raw_text)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            data = data[0]
+
+        name = ""
+        desc = ""
+        keywords: list[str] = []
+
+        if isinstance(data, dict):
+            name = sanitize_text(data.get("name") or data.get("label") or data.get("title") or "")
+            desc = sanitize_text(data.get("description", ""))
+            keywords_raw = data.get("keywords", [])
+            if isinstance(keywords_raw, str):
+                keywords = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+            elif isinstance(keywords_raw, list):
+                keywords = [sanitize_text(k) for k in keywords_raw if sanitize_text(k)]
+        else:
+            # Parse-repair for partially structured outputs.
+            name_match = re.search(r'"(?:name|label|title)"\s*:\s*"([^"]+)"', raw_text)
+            desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', raw_text)
+            kw_match = re.search(r'"keywords"\s*:\s*\[([^\]]*)\]', raw_text)
+            if name_match:
+                name = sanitize_text(name_match.group(1))
+            if desc_match:
+                desc = sanitize_text(desc_match.group(1))
+            if kw_match:
+                keywords = [
+                    sanitize_text(tok.strip().strip('"').strip("'"))
+                    for tok in kw_match.group(1).split(",")
+                    if sanitize_text(tok.strip().strip('"').strip("'"))
+                ]
+            if not name:
+                first_line = sanitize_text(raw_text.splitlines()[0] if raw_text.splitlines() else raw_text)
+                first_line = first_line.replace('"', "").replace("{", "").replace("}", "")
+                name = sanitize_text(first_line.split(":", 1)[0])
+
+        name = base_label(name)
+        canonical_name = _canonical_label_key(name)
+        if not canonical_name:
+            rejection_reasons.append(f"attempt={attempt}:missing_name")
+            continue
+        if canonical_name in dynamic_banned_keys:
+            rejection_reasons.append(f"attempt={attempt}:banned_name={canonical_name}")
+            continue
+        if any(tok in canonical_name for tok in generic_tokens):
+            dynamic_banned_keys.add(canonical_name)
+            rejection_reasons.append(f"attempt={attempt}:generic_name={canonical_name}")
+            continue
+        if len(name.split()) < 2:
+            # Avoid one-word labels that tend to be underspecified.
+            dynamic_banned_keys.add(canonical_name)
+            rejection_reasons.append(f"attempt={attempt}:too_short_name={canonical_name}")
+            continue
+
+        if not keywords:
+            _, fallback_keywords = propose_label_and_keywords_from_texts(examples, parent_label=None, max_keywords=6)
+            keywords = [sanitize_text(k) for k in fallback_keywords if sanitize_text(k)]
+        keywords = keywords[:6]
+        return name, desc, keywords
+
+    if rejection_reasons:
+        logging.warning(
+            "vLLM cluster labeling exhausted retries%s. Reasons: %s",
+            f" ({context})" if context else "",
+            "; ".join(rejection_reasons[-max_attempts:]),
+        )
+    return None
+
+
+def _enforce_unique_choice_labels(
+    df: pd.DataFrame,
+    cluster_col: str = "cluster_id",
+    label_col: str = "agglomerative_label",
+) -> int:
+    """
+    Force labels to be unique under the exact normalization used for choices.
+    Returns number of cluster labels modified.
+    """
+    if df.empty or cluster_col not in df.columns or label_col not in df.columns:
+        return 0
+
+    cluster_ids = sorted(df[cluster_col].unique())
+    cluster_labels = df.groupby(cluster_col)[label_col].first().astype(str).to_dict()
+
+    seen: set[str] = set()
+    new_map: dict[int, str] = {}
+    changed = 0
+    for cid in cluster_ids:
+        canonical = build_label_string(cluster_labels.get(cid, f"cluster_{cid}"))
+        if canonical in seen:
+            canonical = build_label_string(f"{base_label(canonical)}__c{cid}")
+            changed += 1
+        seen.add(canonical)
+        new_map[cid] = canonical
+
+    if changed > 0:
+        df[label_col] = df[cluster_col].map(new_map)
+    return changed
 
 
 def _select_poor_candidates(
@@ -651,47 +1037,31 @@ def _select_poor_candidates(
     entropy_list: list[float],
     assigned_rank_list: list[int | None],
     min_poorly_explained_for_add: int,
+    low_confidence_threshold_add: float,
+    low_confidence_quantile_add: float,
+    entropy_threshold_add: float,
 ) -> list[int]:
     N = len(pmax_list)
     if N == 0:
-        return []
+        return [], low_confidence_threshold_add
     K = max(min_poorly_explained_for_add, int(0.05 * N))
     order = np.argsort(pmax_list)
     bottom_k = order[:K]
+    q = float(np.clip(low_confidence_quantile_add, 0.0, 1.0))
+    quantile_threshold = float(np.quantile(np.asarray(pmax_list, dtype=float), q))
+    dynamic_pmax_threshold = max(float(low_confidence_threshold_add), quantile_threshold)
     selected = []
     for idx in bottom_k:
+        pmax = pmax_list[idx]
         ent = entropy_list[idx]
         rank = assigned_rank_list[idx]
-        if ent >= ENTROPY_THRESHOLD_ADD and (rank is None or rank > 1):
+        if (
+            pmax <= dynamic_pmax_threshold
+            and ent >= entropy_threshold_add
+            and (rank is None or rank > 1)
+        ):
             selected.append(idx)
-    return selected
-
-    examples = [t.replace("\n", " ").strip() for t in texts if t][:8]
-    if not examples:
-        return None
-    prompt = (
-        "Given these example sentences, propose a short label (2-5 words), "
-        "a one-sentence description, and up to 6 keywords. "
-        "Return JSON with keys: name, description, keywords.\n\n"
-        "Examples:\n- " + "\n- ".join(examples)
-    )
-
-    sampling_params = SamplingParams(temperature=0.2, max_tokens=256)
-    tokenizer, model = load_vllm_model(model_name)
-    outputs = model.generate([prompt], sampling_params)
-    text = outputs[0].outputs[0].text if outputs else ""
-    import json
-    try:
-        data = json.loads(text)
-        name = sanitize_text(data.get("name", ""))
-        desc = sanitize_text(data.get("description", ""))
-        keywords = data.get("keywords", [])
-        if not isinstance(keywords, list):
-            keywords = []
-        keywords = [sanitize_text(k) for k in keywords if sanitize_text(k)]
-        return name, desc, keywords
-    except Exception:
-        return None
+    return selected, dynamic_pmax_threshold
 
 
 def _rename_duplicate_labels(
@@ -924,13 +1294,14 @@ def apply_schema_updates(
     idx_to_emb_pos_map: dict,
     actions: dict,
     next_new_cluster_id: int,
-) -> tuple[pd.DataFrame, int, list[tuple[int, int]]]:
-    """Apply split, merge, remove actions to merged_df and return updated df, next available cluster id, and split pairs."""
+) -> tuple[pd.DataFrame, int, list[tuple[int, int]], list[tuple[int, list[int]]]]:
+    """Apply split, merge, remove actions to merged_df and return updated df, next available cluster id, split pairs, and merge groups."""
     from sklearn.cluster import KMeans
     pre_clusters = merged_df['cluster_id'].nunique()
     logging.info(f"Starting to apply schema updates. Initial #clusters: {pre_clusters}")
     current_df = merged_df.copy() # Work on a copy
     split_pairs: list[tuple[int, int]] = []
+    merge_groups: list[tuple[int, list[int]]] = []
 
     # Remove clusters
     if actions['remove']:
@@ -958,6 +1329,13 @@ def apply_schema_updates(
                  unite_sets(c1, c2)
             else:
                 logging.warning(f"Skipping merge of ({c1},{c2}), one or both clusters no longer exist or were not in initial parent map.")
+        groups: dict[int, list[int]] = {}
+        for cid in sorted(parent.keys()):
+            root = find_set(cid)
+            groups.setdefault(root, []).append(cid)
+        merge_groups = [(root, members) for root, members in groups.items() if len(members) > 1]
+        if merge_groups:
+            logging.info("  Merge groups formed: %s", merge_groups)
         current_df['cluster_id'] = current_df['cluster_id'].apply(lambda x: find_set(x) if x in parent else x)
 
     count_before_split = current_df['cluster_id'].nunique()
@@ -1010,7 +1388,7 @@ def apply_schema_updates(
     if actions.get('split'):
         expected = count_before_split + len(actions['split'])
         assert post_clusters == expected, f"Split count mismatch: expected {expected}, got {post_clusters}"
-    return current_df, next_new_cluster_id, split_pairs
+    return current_df, next_new_cluster_id, split_pairs, merge_groups
 
 
 def em_schema_refinement(
@@ -1031,14 +1409,20 @@ def em_schema_refinement(
         diagnostics_sample_size: int = 200,
         diagnostics_bins: int = 40,
         diagnostics_dir: Path | None = None,
-        low_confidence_threshold_add: float = LOW_CONFIDENCE_THRESHOLD_ADD,
-        min_poorly_explained_for_add: int = MIN_POORLY_EXPLAINED_FOR_ADD,
-        items_per_new_cluster_add: int = ITEMS_PER_NEW_CLUSTER_ADD,
         config: SchemaRefinementConfig | None = None,
 ): 
     """Run an EM-like schema refinement loop, returning updated merged_df and history of schema changes."""
     if config is None:
         config = SchemaRefinementConfig()
+    logging.info(
+        "Operation config: tune_operation=%s | split=%s merge=%s remove=%s add=%s revise=%s",
+        config.tune_operation,
+        config.operation_enabled("split"),
+        config.operation_enabled("merge"),
+        config.operation_enabled("remove"),
+        config.operation_enabled("add"),
+        config.operation_enabled("revise"),
+    )
     logging.info(f"Starting EM-style schema refinement for {max_iters} iterations...")
     logging.info(f"Computing initial sentence embeddings using {embedding_model_name}...")
     
@@ -1056,6 +1440,15 @@ def em_schema_refinement(
     current_merged_df['agglomerative_label'] = current_merged_df['cluster_id'].map(schema_state.label_map)
     current_choices_list = list(schema_state.choices_list)
     current_prob_calibrator = prob_calibrator
+    token_count_tokenizer = getattr(current_prob_calibrator, "tokenizer", None) or getattr(current_prob_calibrator, "vllm_tokenizer", None)
+    if token_count_tokenizer is None and model_type == "hf":
+        try:
+            token_count_tokenizer = AutoTokenizer.from_pretrained(model_identifier)
+            logging.info("Loaded tokenizer '%s' for token-count-aware metrics.", model_identifier)
+        except Exception as exc:
+            logging.warning("Could not load tokenizer for token-count-aware metrics: %s. Falling back to whitespace token counts.", exc)
+    elif token_count_tokenizer is None:
+        logging.warning("No model tokenizer handle available for token counts. Falling back to whitespace token counts.")
     schema_history = []
     if current_merged_df['cluster_id'].empty:
         logging.warning("Initial merged_df has no cluster_id assignments. Starting new cluster IDs from 0.")
@@ -1065,6 +1458,7 @@ def em_schema_refinement(
     logging.info("Calculating baseline log p(x) for the dataset...")
     sample_size_for_baseline = min(baseline_sample_size, len(current_merged_df))
     baseline_log_px = 0.0 # Initialize baseline_log_px
+    accepted_avg_logL_per_token = None
     if sample_size_for_baseline > 0:
         texts_for_baseline_sample = current_merged_df[text_column_name].sample(sample_size_for_baseline).tolist()
         baseline_log_px = current_prob_calibrator.compute_average_log_px_from_sample(texts_for_baseline_sample)
@@ -1081,6 +1475,10 @@ def em_schema_refinement(
             embeddings=all_embeddings if 'all_embeddings' in locals() else None,
             p_z_prior=schema_state.p_z_prior,
         )
+        token_counts = estimate_token_counts(
+            current_merged_df[text_column_name].astype(str).tolist(),
+            tokenizer=token_count_tokenizer,
+        )
         # Persist per-row pmax / assignments for analysis
         current_merged_df["pmax_explained"] = doc_scores["row_pmax_posterior"]     
         current_merged_df["z_hat_explainer"] = doc_scores["row_z_hat"]   
@@ -1089,7 +1487,7 @@ def em_schema_refinement(
         corpus_scores = compute_corpus_level_scores(
             log_px_given_z_hat=doc_scores["row_log_px_given_z"][np.arange(len(current_merged_df)),
                                                                     current_merged_df["z_hat_explainer"].values],
-            token_counts=None,             # plug true token counts if you track them
+            token_counts=token_counts,
             k_complexity=len(current_choices_list),  # simple complexity proxy
             is_test_mask=None,
             q_ij=doc_scores["PZX"],
@@ -1099,14 +1497,19 @@ def em_schema_refinement(
 
         logging.info(f"[E-step] L_baseline={doc_scores['L_baseline']:.4f}, "
                     f"logL_total={corpus_scores['logL_cond_total']:.2f}, "
+                    f"avg_logL_tok={corpus_scores['avg_logL_per_token']:.6f}, "
                     f"AIC={corpus_scores['AIC']}, BIC={corpus_scores['BIC']}, "
-                    f"PPL={corpus_scores['perplexity']:.3f}, "
+                    f"PPL_tok={corpus_scores['perplexity_token']:.3f}, "
                     f"ELBO={corpus_scores['ELBO']}")  
+        accepted_avg_logL_per_token = float(corpus_scores["avg_logL_per_token"])
     else:
         logging.warning(f"  Dataset is empty or too small for baseline sample, cannot compute baseline log p(x). Using {baseline_log_px}.")
 
     split_cooldown: dict[int, int] = {}
+    revise_cooldown: dict[int, int] = {}
     add_cooldown_until = 0
+    no_op_iters = 0
+    iteration_metrics_rows: list[dict] = []
     for iter_idx in range(max_iters):
         logging.info(f"=== EM Iteration {iter_idx + 1}/{max_iters} ===")
         iteration_actions = {}
@@ -1114,6 +1517,15 @@ def em_schema_refinement(
         if current_merged_df.empty:
             logging.warning(f"Iteration {iter_idx + 1}: Dataframe is empty. Stopping EM refinement.")
             break
+        prev_merged_df = current_merged_df.copy()
+        prev_schema_state = schema_state
+        prev_choices_list = list(current_choices_list)
+        prev_prob_calibrator = current_prob_calibrator
+        prev_token_count_tokenizer = token_count_tokenizer
+        prev_split_cooldown = dict(split_cooldown)
+        prev_revise_cooldown = dict(revise_cooldown)
+        prev_add_cooldown_until = add_cooldown_until
+        prev_next_new_cluster_id = next_new_cluster_id
         logging.info(f"Iteration {iter_idx + 1}: Computing cluster metrics for {current_merged_df['cluster_id'].nunique()} clusters.")
         cluster_metrics = compute_cluster_metrics(
             current_merged_df, 
@@ -1149,10 +1561,18 @@ def em_schema_refinement(
                     diag_summary.get("entropy_median", float("nan")),
                 )
 
-        actions = decide_schema_updates(cluster_metrics, config, split_cooldown, iter_idx + 1, verbose=verbose, log_top_pairs=log_top_pairs)
+        actions = decide_schema_updates(
+            cluster_metrics,
+            config,
+            split_cooldown,
+            revise_cooldown,
+            iter_idx + 1,
+            verbose=verbose,
+            log_top_pairs=log_top_pairs,
+        )
         iteration_actions.update(actions)
-        logging.info(f"Iteration {iter_idx + 1}: Actions decided from metrics (Split/Merge/Remove): {actions}. 'Add' actions to be determined next.")
-        current_merged_df, next_new_cluster_id, split_pairs = apply_schema_updates(
+        logging.info(f"Iteration {iter_idx + 1}: Actions decided from metrics (Split/Merge/Remove/Revise): {actions}. 'Add' actions to be determined next.")
+        current_merged_df, next_new_cluster_id, split_pairs, merge_groups = apply_schema_updates(
             current_merged_df,
             all_embeddings,
             idx_to_emb_pos_map,
@@ -1161,40 +1581,187 @@ def em_schema_refinement(
         )
         if split_pairs:
             for parent_id, _ in split_pairs:
-                split_cooldown[parent_id] = (iter_idx + 1) + config.cooldown_iters_after_split
+                split_cooldown[parent_id] = (iter_idx + 1) + config.split_cooldown_iters
 
         # Rename split children (and parents) with meaningful labels based on exemplar texts
         split_child_ids = {child for _, child in split_pairs}
-        if split_pairs and config.enable_splits:
+        if split_pairs and config.operation_enabled("split"):
+            shared_vllm_tokenizer = getattr(current_prob_calibrator, "vllm_tokenizer", None)
+            shared_vllm_model = getattr(current_prob_calibrator, "vllm_model", None)
             for parent_id, child_id in split_pairs:
                 parent_label = schema_state.label_map.get(parent_id, f"cluster_{parent_id}")
                 parent_texts = current_merged_df.loc[current_merged_df["cluster_id"] == parent_id, text_column_name].astype(str).tolist()
                 child_texts = current_merged_df.loc[current_merged_df["cluster_id"] == child_id, text_column_name].astype(str).tolist()
+                parent_samples = _sample_texts_for_labeling(parent_texts, max_texts=10, seed=int(parent_id))
+                child_samples = _sample_texts_for_labeling(child_texts, max_texts=10, seed=int(child_id))
                 parent_base = base_label(parent_label)
 
                 new_parent_label = None
                 new_child_label = None
-                if config.enable_splits and model_type == "vllm":
-                    parent_llm = _label_cluster_vllm(parent_texts, model_identifier)
-                    child_llm = _label_cluster_vllm(child_texts, model_identifier)
+                if config.operation_enabled("split") and model_type == "vllm":
+                    parent_llm = _label_cluster_vllm(
+                        parent_samples,
+                        model_identifier,
+                        tokenizer=shared_vllm_tokenizer,
+                        model=shared_vllm_model,
+                        contrast_texts=child_samples,
+                        parent_label=parent_base,
+                        context=f"split_parent:{parent_id}",
+                    )
                     if parent_llm:
                         name, _, keywords = parent_llm
                         new_parent_label = build_label_string(name or parent_base, keywords)
-                    if child_llm:
-                        name, _, keywords = child_llm
-                        new_child_label = build_label_string(name or parent_base, keywords)
 
                 if not new_parent_label:
-                    name, keywords = propose_label_and_keywords_from_texts(parent_texts, parent_label=parent_base)
-                    new_parent_label = build_label_string(name, keywords)
+                    logging.info(
+                        "Split relabel fallback for parent cluster %s: using heuristic label generation.",
+                        parent_id,
+                    )
+                    new_parent_label = _fallback_distinct_label_from_texts(parent_samples, banned_names=[parent_base])
+                    if not new_parent_label:
+                        name, keywords = propose_label_and_keywords_from_texts(parent_samples, parent_label=None, max_keywords=6)
+                        new_parent_label = build_label_string(name, keywords)
+
+                if config.operation_enabled("split") and model_type == "vllm":
+                    child_llm = _label_cluster_vllm(
+                        child_samples,
+                        model_identifier,
+                        tokenizer=shared_vllm_tokenizer,
+                        model=shared_vllm_model,
+                        contrast_texts=parent_samples,
+                        parent_label=parent_base,
+                        banned_names=[new_parent_label, parent_base],
+                        context=f"split_child:{child_id}",
+                    )
+                    if child_llm:
+                        name, _, keywords = child_llm
+                        new_child_label = build_label_string(name or "Split Child", keywords)
+
                 if not new_child_label:
-                    name, keywords = propose_label_and_keywords_from_texts(child_texts, parent_label=parent_base)
-                    new_child_label = build_label_string(name, keywords)
-                if new_child_label == new_parent_label:
-                    new_child_label = build_label_string(f"{new_child_label} B")
+                    logging.info(
+                        "Split relabel fallback for child cluster %s: using heuristic label generation.",
+                        child_id,
+                    )
+                    new_child_label = _fallback_distinct_label_from_texts(
+                        child_samples,
+                        banned_names=[new_parent_label, parent_base],
+                    )
+                    if not new_child_label:
+                        name, keywords = propose_label_and_keywords_from_texts(
+                            child_samples,
+                            parent_label=None,
+                            max_keywords=6,
+                        )
+                        new_child_label = build_label_string(name, keywords)
+
+                if _canonical_label_key(new_child_label) == _canonical_label_key(new_parent_label):
+                    if config.operation_enabled("split") and model_type == "vllm":
+                        child_llm_retry = _label_cluster_vllm(
+                            child_samples,
+                            model_identifier,
+                            tokenizer=shared_vllm_tokenizer,
+                            model=shared_vllm_model,
+                            contrast_texts=parent_samples,
+                            parent_label=parent_base,
+                            banned_names=[new_parent_label, parent_base, new_child_label],
+                            context=f"split_child_retry:{child_id}",
+                        )
+                        if child_llm_retry:
+                            name, _, keywords = child_llm_retry
+                            new_child_label = build_label_string(name or "Split Child", keywords)
+
+                if _canonical_label_key(new_child_label) == _canonical_label_key(new_parent_label):
+                    retry_fallback = _fallback_distinct_label_from_texts(
+                        child_samples,
+                        banned_names=[new_parent_label, parent_base, new_child_label],
+                    )
+                    if retry_fallback:
+                        new_child_label = retry_fallback
+
+                if _canonical_label_key(new_child_label) == _canonical_label_key(new_parent_label):
+                    new_child_label = build_label_string(f"{base_label(new_parent_label)}__c{child_id}")
 
                 current_merged_df.loc[current_merged_df["cluster_id"] == parent_id, "agglomerative_label"] = new_parent_label
                 current_merged_df.loc[current_merged_df["cluster_id"] == child_id, "agglomerative_label"] = new_child_label
+
+        if merge_groups and config.operation_enabled("merge"):
+            shared_vllm_tokenizer = getattr(current_prob_calibrator, "vllm_tokenizer", None)
+            shared_vllm_model = getattr(current_prob_calibrator, "vllm_model", None)
+            for root_id, member_ids in merge_groups:
+                if root_id not in set(current_merged_df["cluster_id"].unique()):
+                    continue
+                source_labels = [
+                    schema_state.label_map.get(mid, f"cluster_{mid}")
+                    for mid in member_ids
+                ]
+                merged_texts = current_merged_df.loc[
+                    current_merged_df["cluster_id"] == root_id, text_column_name
+                ].astype(str).tolist()
+                merged_samples = _sample_texts_for_labeling(merged_texts, max_texts=12, seed=int(root_id))
+                new_merge_label = None
+                if model_type == "vllm":
+                    llm_label = _label_cluster_vllm(
+                        merged_samples,
+                        model_identifier,
+                        tokenizer=shared_vllm_tokenizer,
+                        model=shared_vllm_model,
+                        parent_label=" + ".join(base_label(lbl) for lbl in source_labels[:2]),
+                        banned_names=source_labels,
+                        context=f"merge_cluster:{root_id}",
+                    )
+                    if llm_label:
+                        name, _, keywords = llm_label
+                        new_merge_label = build_label_string(name, keywords)
+                if not new_merge_label:
+                    new_merge_label = _fallback_distinct_label_from_texts(merged_samples, banned_names=source_labels)
+                    if not new_merge_label:
+                        name, keywords = propose_label_and_keywords_from_texts(merged_samples, parent_label=None)
+                        new_merge_label = build_label_string(name, keywords)
+                current_merged_df.loc[current_merged_df["cluster_id"] == root_id, "agglomerative_label"] = new_merge_label
+                logging.info(
+                    "Merge relabel: cluster %s (members=%s) -> '%s'",
+                    root_id,
+                    member_ids,
+                    new_merge_label,
+                )
+
+        revised_clusters_applied: list[int] = []
+        if actions.get("revise") and config.operation_enabled("revise"):
+            shared_vllm_tokenizer = getattr(current_prob_calibrator, "vllm_tokenizer", None)
+            shared_vllm_model = getattr(current_prob_calibrator, "vllm_model", None)
+            current_cluster_ids = set(current_merged_df["cluster_id"].unique())
+            for cid in actions["revise"]:
+                if cid not in current_cluster_ids:
+                    logging.warning("Revise requested for cluster %s, but cluster no longer exists after structural updates.", cid)
+                    continue
+                current_label = str(current_merged_df.loc[current_merged_df["cluster_id"] == cid, "agglomerative_label"].iloc[0])
+                revise_texts = current_merged_df.loc[current_merged_df["cluster_id"] == cid, text_column_name].astype(str).tolist()
+                revise_samples = _sample_texts_for_labeling(revise_texts, max_texts=12, seed=int(cid))
+                new_label = None
+                if model_type == "vllm":
+                    llm_label = _label_cluster_vllm(
+                        revise_samples,
+                        model_identifier,
+                        tokenizer=shared_vllm_tokenizer,
+                        model=shared_vllm_model,
+                        parent_label=base_label(current_label),
+                        banned_names=[current_label],
+                        context=f"revise_cluster:{cid}",
+                    )
+                    if llm_label:
+                        name, _, keywords = llm_label
+                        new_label = build_label_string(name, keywords)
+                if not new_label:
+                    new_label = _fallback_distinct_label_from_texts(revise_samples, banned_names=[current_label])
+                    if not new_label:
+                        name, keywords = propose_label_and_keywords_from_texts(revise_samples, parent_label=base_label(current_label))
+                        new_label = build_label_string(name, keywords)
+                current_merged_df.loc[current_merged_df["cluster_id"] == cid, "agglomerative_label"] = new_label
+                revised_clusters_applied.append(int(cid))
+                logging.info("Revise relabel: cluster %s '%s' -> '%s'", cid, current_label, new_label)
+            iteration_actions["revise"] = revised_clusters_applied
+            for cid in revised_clusters_applied:
+                revise_cooldown[cid] = (iter_idx + 1) + config.revise_cooldown_iters
 
         # Rename any exact duplicates to avoid suffixes like __cXYZ
         dup_renamed = _rename_duplicate_labels(current_merged_df, text_column_name)
@@ -1253,7 +1820,9 @@ def em_schema_refinement(
         add_prev_cluster_ids = None
         schema_unstable = bool(actions.get("split") or actions.get("merge") or actions.get("remove") or duplicates_prevented)
         added_clusters_info = []
-        if schema_unstable:
+        if not config.operation_enabled("add"):
+            logging.info("  Skipping add-step because add operation is disabled by tune configuration.")
+        elif schema_unstable:
             logging.info("  Skipping add-step due to schema instability (splits/merges/removes or duplicate guardrail).")
         elif iter_idx + 1 <= add_cooldown_until:
             logging.info("  Skipping add-step due to cooldown (last add in iter %s).", add_cooldown_until - 1)
@@ -1281,28 +1850,35 @@ def em_schema_refinement(
 
             if pmax_vals:
                 logging.info(
-                    f"  pmax stats vs add-threshold {low_confidence_threshold_add}: "
+                    f"  pmax stats vs add-threshold {config.add_low_confidence_max}: "
                     f"min/median/max={np.min(pmax_vals):.4f}/{np.median(pmax_vals):.4f}/{np.max(pmax_vals):.4f}"
                 )
 
-            poor_pos = _select_poor_candidates(
+            poor_pos, dynamic_pmax_threshold = _select_poor_candidates(
                 pmax_vals,
                 entropy_vals,
                 assigned_ranks,
-                min_poorly_explained_for_add,
+                config.add_min_poorly_explained,
+                config.add_low_confidence_max,
+                config.add_low_confidence_quantile,
+                config.add_entropy_min,
             )
             poor_indices = [all_indices[i] for i in poor_pos]
             logging.info(
-                "  Add-step candidates: bottom-K=%s, filtered_poor=%s",
-                max(min_poorly_explained_for_add, int(0.05 * len(current_merged_df))),
+                "  Add-step candidates: bottom-K=%s, filtered_poor=%s (pmax<=dynamic %.3f from max(fixed %.3f, quantile q=%.3f), entropy>=%.3f, rank>1)",
+                max(config.add_min_poorly_explained, int(0.05 * len(current_merged_df))),
                 len(poor_indices),
+                dynamic_pmax_threshold,
+                config.add_low_confidence_max,
+                config.add_low_confidence_quantile,
+                config.add_entropy_min,
             )
 
-            if len(current_choices_list) >= MAX_TOTAL_CLUSTERS:
+            if len(current_choices_list) >= config.add_max_total_clusters:
                 logging.info("  Max total clusters reached; skipping add-step.")
                 poor_indices = []
 
-            if len(poor_indices) >= min_poorly_explained_for_add:
+            if len(poor_indices) >= config.add_min_poorly_explained:
                 logging.info(f"  Found {len(poor_indices)} texts poorly explained. Attempting to form new clusters.")
                 valid_poor_indices = []
                 poor_emb_positions = []
@@ -1319,8 +1895,8 @@ def em_schema_refinement(
                     prev_cluster_ids = current_merged_df.loc[valid_poor_indices, "cluster_id"].copy()
                     add_prev_cluster_ids = prev_cluster_ids
                     emb_poor = all_embeddings[poor_emb_positions]
-                    num_new_clusters_to_add = max(1, len(valid_poor_indices) // items_per_new_cluster_add)
-                    num_new_clusters_to_add = min(num_new_clusters_to_add, MAX_NEW_CLUSTERS_PER_ITER)
+                    num_new_clusters_to_add = max(1, len(valid_poor_indices) // config.add_items_per_new_cluster)
+                    num_new_clusters_to_add = min(num_new_clusters_to_add, config.add_max_new_clusters_per_iter)
                     logging.info(f"  Attempting to create {num_new_clusters_to_add} new clusters from these texts.")
                     from sklearn.cluster import KMeans
                     if len(emb_poor) < num_new_clusters_to_add:
@@ -1338,24 +1914,41 @@ def em_schema_refinement(
                             new_labels_for_poor_texts = kmeans_poor.fit_predict(emb_poor)
                             for k_new_cluster in range(k_try):
                                 new_cluster_original_indices = [valid_poor_indices[i] for i, lab in enumerate(new_labels_for_poor_texts) if lab == k_new_cluster]
-                                if len(new_cluster_original_indices) < MIN_GROUP_SIZE_ADD:
+                                if len(new_cluster_original_indices) < config.add_min_group_size:
                                     continue
                                 E = all_embeddings[[idx_to_emb_pos_map[i] for i in new_cluster_original_indices]]
                                 centroid = E.mean(axis=0, keepdims=True)
                                 sims = cosine_similarity(E, centroid).flatten()
-                                if float(np.mean(sims)) < ADD_COHESION_THRESHOLD:
+                                if float(np.mean(sims)) < config.add_cohesion_min:
                                     continue
                                 assigned_new_id = next_new_cluster_id
                                 next_new_cluster_id += 1
                                 current_merged_df.loc[new_cluster_original_indices, 'cluster_id'] = assigned_new_id
                                 texts = current_merged_df.loc[new_cluster_original_indices, text_column_name].astype(str).tolist()
-                                name, keywords = propose_label_and_keywords_from_texts(texts, parent_label=None)
-                                new_label = build_label_string(name, keywords)
+                                new_label = None
+                                if model_type == "vllm":
+                                    llm_label = _label_cluster_vllm(
+                                        texts,
+                                        model_identifier,
+                                        tokenizer=getattr(current_prob_calibrator, "vllm_tokenizer", None),
+                                        model=getattr(current_prob_calibrator, "vllm_model", None),
+                                        context=f"add_cluster:{assigned_new_id}",
+                                    )
+                                    if llm_label:
+                                        name, _, keywords = llm_label
+                                        new_label = build_label_string(name, keywords)
+                                if not new_label:
+                                    logging.info(
+                                        "Add-step relabel fallback for new cluster %s: using heuristic label generation.",
+                                        assigned_new_id,
+                                    )
+                                    name, keywords = propose_label_and_keywords_from_texts(texts, parent_label=None)
+                                    new_label = build_label_string(name, keywords)
                                 current_merged_df.loc[new_cluster_original_indices, 'agglomerative_label'] = new_label
                                 added_clusters_info.append({'id': assigned_new_id, 'size': len(new_cluster_original_indices)})
                                 logging.info(f"    Added new cluster {assigned_new_id} with {len(new_cluster_original_indices)} texts.")
                                 created += 1
-                                if created >= MAX_NEW_CLUSTERS_PER_ITER:
+                                if created >= config.add_max_new_clusters_per_iter:
                                     break
                             if created > 0:
                                 break
@@ -1366,7 +1959,11 @@ def em_schema_refinement(
                     except Exception as e:
                         logging.error(f"  KMeans failed for adding new clusters from poorly explained texts: {e}")
             else:
-                logging.info(f"  Found {len(poor_indices)} poorly explained texts (threshold: {min_poorly_explained_for_add}). Not adding new clusters based on this criterion.")
+                logging.info(
+                    "  Found %s poorly explained texts (threshold: %s). Not adding new clusters based on this criterion.",
+                    len(poor_indices),
+                    config.add_min_poorly_explained,
+                )
         # Guardrail: reject added clusters if they are near-duplicate labels
         if added_clusters_info:
             labels_now = current_merged_df.groupby("cluster_id")["agglomerative_label"].first().astype(str).tolist()
@@ -1377,11 +1974,10 @@ def em_schema_refinement(
                     current_merged_df.loc[add_prev_cluster_ids.index, "cluster_id"] = add_prev_cluster_ids.values
                 added_clusters_info = []
             else:
-                add_cooldown_until = (iter_idx + 1) + 1
+                add_cooldown_until = (iter_idx + 1) + config.add_cooldown_iters
 
         iteration_actions['add'] = added_clusters_info
         logging.info(f"Iteration {iter_idx + 1}: 'Add' actions decided: {added_clusters_info}. Total actions for iteration: {iteration_actions}")
-        schema_history.append(iteration_actions)
         if current_merged_df.empty:
             logging.warning(f"Iteration {iter_idx + 1}: Dataframe became empty after updates. Stopping EM refinement.")
             break
@@ -1392,10 +1988,26 @@ def em_schema_refinement(
 
         # Ensure no exact-duplicate labels remain.
         dup_renamed += _rename_duplicate_labels(current_merged_df, text_column_name)
+        forced_unique = _enforce_unique_choice_labels(current_merged_df)
+        if forced_unique > 0:
+            logging.warning(
+                "Iteration %s: enforced unique schema labels for %s clusters to avoid duplicate choices.",
+                iter_idx + 1,
+                forced_unique,
+            )
 
         schema_state = build_schema_state_from_df(current_merged_df)
         current_merged_df['agglomerative_label'] = current_merged_df['cluster_id'].map(schema_state.label_map)
         current_choices_list = list(schema_state.choices_list)
+        if len(set(current_choices_list)) != len(current_choices_list):
+            forced_unique += _enforce_unique_choice_labels(current_merged_df)
+            schema_state = build_schema_state_from_df(current_merged_df)
+            current_merged_df['agglomerative_label'] = current_merged_df['cluster_id'].map(schema_state.label_map)
+            current_choices_list = list(schema_state.choices_list)
+            if len(set(current_choices_list)) != len(current_choices_list):
+                raise ValueError(
+                    "Internal invariant violation: schema choices are not unique after uniqueness enforcement."
+                )
 
         # IMPORTANT: keep calibrator choices aligned with current schema before any metric recomputation.
         if list(current_prob_calibrator.choices) != list(current_choices_list):
@@ -1423,12 +2035,14 @@ def em_schema_refinement(
         else:
             logging.info(f"Iteration {iter_idx + 1}: Choices unchanged; reusing existing ProbabilityCalibrator.")
 
+        token_count_tokenizer = getattr(current_prob_calibrator, "tokenizer", None) or getattr(current_prob_calibrator, "vllm_tokenizer", None) or token_count_tokenizer
+
         # Keep calibrator prior aligned with current schema
         if schema_state.p_z_prior is not None:
             current_prob_calibrator.p_z = schema_state.p_z_prior
 
         logging.info(
-            "Schema diff (iter %s): #labels=%s, renamed_duplicates=%s, adds=%s, splits=%s, merges=%s, removes=%s",
+            "Schema diff (iter %s): #labels=%s, renamed_duplicates=%s, adds=%s, splits=%s, merges=%s, removes=%s, revises=%s",
             iter_idx + 1,
             len(current_choices_list),
             dup_renamed,
@@ -1436,9 +2050,13 @@ def em_schema_refinement(
             len(iteration_actions.get("split", [])),
             len(iteration_actions.get("merge", [])),
             len(iteration_actions.get("remove", [])),
+            len(iteration_actions.get("revise", [])),
         )
 
-        if log_iteration_metrics:
+        should_compute_iter_metrics = log_iteration_metrics or config.rollback_on_metric_degrade
+        doc_scores_iter = None
+        corpus_scores_iter = None
+        if should_compute_iter_metrics:
             doc_scores_iter = compute_document_level_scores(
                 df=current_merged_df,
                 text_col=text_column_name,
@@ -1448,10 +2066,14 @@ def em_schema_refinement(
                 embeddings=all_embeddings if 'all_embeddings' in locals() else None,
                 p_z_prior=getattr(current_prob_calibrator, "p_z", None),
             )
+            token_counts_iter = estimate_token_counts(
+                current_merged_df[text_column_name].astype(str).tolist(),
+                tokenizer=token_count_tokenizer,
+            )
             corpus_scores_iter = compute_corpus_level_scores(
                 log_px_given_z_hat=doc_scores_iter["row_log_px_given_z"][np.arange(len(current_merged_df)),
                                                                             doc_scores_iter["row_z_hat"]],
-                token_counts=None,
+                token_counts=token_counts_iter,
                 k_complexity=len(current_choices_list),
                 is_test_mask=None,
                 q_ij=doc_scores_iter["PZX"],
@@ -1461,10 +2083,125 @@ def em_schema_refinement(
             logging.info(
                 f"[Iter {iter_idx + 1}] L_baseline={doc_scores_iter['L_baseline']:.4f}, "
                 f"logL_total={corpus_scores_iter['logL_cond_total']:.2f}, "
+                f"avg_logL_tok={corpus_scores_iter['avg_logL_per_token']:.6f}, "
                 f"AIC={corpus_scores_iter['AIC']}, BIC={corpus_scores_iter['BIC']}, "
-                f"PPL={corpus_scores_iter['perplexity']:.3f}, "
+                f"PPL_tok={corpus_scores_iter['perplexity_token']:.3f}, "
                 f"ELBO={corpus_scores_iter['ELBO']}"
             )
+
+        proposed_action_count = int(
+            len(iteration_actions.get("split", []))
+            + len(iteration_actions.get("merge", []))
+            + len(iteration_actions.get("remove", []))
+            + len(iteration_actions.get("add", []))
+            + len(iteration_actions.get("revise", []))
+        )
+        accepted_update = True
+        metric_delta = np.nan
+        if (
+            config.rollback_on_metric_degrade
+            and corpus_scores_iter is not None
+            and accepted_avg_logL_per_token is not None
+            and proposed_action_count > 0
+        ):
+            metric_delta = float(corpus_scores_iter["avg_logL_per_token"] - accepted_avg_logL_per_token)
+            if metric_delta < float(config.accept_min_delta):
+                accepted_update = False
+                logging.warning(
+                    "Iteration %s rejected: avg_logL_per_token delta %.6f < min_delta %.6f. Rolling back schema updates.",
+                    iter_idx + 1,
+                    metric_delta,
+                    float(config.accept_min_delta),
+                )
+                current_merged_df = prev_merged_df
+                schema_state = prev_schema_state
+                current_choices_list = prev_choices_list
+                current_prob_calibrator = prev_prob_calibrator
+                token_count_tokenizer = prev_token_count_tokenizer
+                split_cooldown = prev_split_cooldown
+                revise_cooldown = prev_revise_cooldown
+                add_cooldown_until = prev_add_cooldown_until
+                next_new_cluster_id = prev_next_new_cluster_id
+                unique_cluster_ids_after_iter = sorted(current_merged_df["cluster_id"].unique())
+                iteration_actions["accepted"] = False
+                iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                iteration_actions["proposed_actions"] = {
+                    "split": iteration_actions.get("split", []),
+                    "merge": iteration_actions.get("merge", []),
+                    "remove": iteration_actions.get("remove", []),
+                    "add": iteration_actions.get("add", []),
+                    "revise": iteration_actions.get("revise", []),
+                }
+                iteration_actions["split"] = []
+                iteration_actions["merge"] = []
+                iteration_actions["remove"] = []
+                iteration_actions["add"] = []
+                iteration_actions["revise"] = []
+                proposed_action_count = 0
+                if should_compute_iter_metrics:
+                    doc_scores_iter = compute_document_level_scores(
+                        df=current_merged_df,
+                        text_col=text_column_name,
+                        cluster_col="agglomerative_label",
+                        choices=current_choices_list,
+                        prob_calibrator=current_prob_calibrator,
+                        embeddings=all_embeddings if 'all_embeddings' in locals() else None,
+                        p_z_prior=getattr(current_prob_calibrator, "p_z", None),
+                    )
+                    token_counts_iter = estimate_token_counts(
+                        current_merged_df[text_column_name].astype(str).tolist(),
+                        tokenizer=token_count_tokenizer,
+                    )
+                    corpus_scores_iter = compute_corpus_level_scores(
+                        log_px_given_z_hat=doc_scores_iter["row_log_px_given_z"][np.arange(len(current_merged_df)),
+                                                                                    doc_scores_iter["row_z_hat"]],
+                        token_counts=token_counts_iter,
+                        k_complexity=len(current_choices_list),
+                        is_test_mask=None,
+                        q_ij=doc_scores_iter["PZX"],
+                        log_px_given_z=doc_scores_iter["row_log_px_given_z"],
+                        log_pz=np.log(np.clip(doc_scores_iter["pz_prior"], 1e-30, None)),
+                    )
+                no_op_iters += 1
+            else:
+                accepted_avg_logL_per_token = float(corpus_scores_iter["avg_logL_per_token"])
+                iteration_actions["accepted"] = True
+                iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                no_op_iters = 0
+        else:
+            iteration_actions["accepted"] = True
+            if proposed_action_count > 0 and corpus_scores_iter is not None:
+                accepted_avg_logL_per_token = float(corpus_scores_iter["avg_logL_per_token"])
+            if proposed_action_count == 0:
+                no_op_iters += 1
+            else:
+                no_op_iters = 0
+
+        if log_iteration_metrics and corpus_scores_iter is not None:
+            iteration_metrics_rows.append({
+                "iter": int(iter_idx + 1),
+                "clusters": int(len(unique_cluster_ids_after_iter)),
+                "splits": int(len(iteration_actions.get("split", []))),
+                "merges": int(len(iteration_actions.get("merge", []))),
+                "removes": int(len(iteration_actions.get("remove", []))),
+                "adds": int(len(iteration_actions.get("add", []))),
+                "revises": int(len(iteration_actions.get("revise", []))),
+                "accepted": bool(iteration_actions.get("accepted", True)),
+                "delta_vs_best_avg_logL_tok": metric_delta,
+                "mismatch_rate": float(diag_summary["mismatch_rate"]) if diag_summary and diag_summary.get("mismatch_rate") is not None else np.nan,
+                "pmax_median": float(diag_summary["pmax_median"]) if diag_summary and diag_summary.get("pmax_median") is not None else np.nan,
+                "entropy_median": float(diag_summary["entropy_median"]) if diag_summary and diag_summary.get("entropy_median") is not None else np.nan,
+                "L_baseline": float(doc_scores_iter["L_baseline"]),
+                "logL_total": float(corpus_scores_iter["logL_cond_total"]),
+                "token_count_total": float(corpus_scores_iter["token_count_total"]),
+                "avg_logL_per_token": float(corpus_scores_iter["avg_logL_per_token"]),
+                "AIC": float(corpus_scores_iter["AIC"]),
+                "BIC": float(corpus_scores_iter["BIC"]),
+                "PPL": float(corpus_scores_iter["perplexity"]),
+                "PPL_tok": float(corpus_scores_iter["perplexity_token"]),
+                "ELBO": float(corpus_scores_iter["ELBO"]),
+            })
+        schema_history.append(iteration_actions)
         logging.info(f"=== EM Iteration {iter_idx + 1} Complete. #Clusters: {len(unique_cluster_ids_after_iter)} ===")
 
         # Log P(z) for the current schema labels if verbose
@@ -1477,13 +2214,70 @@ def em_schema_refinement(
             else:
                 logging.info("  No data or agglomerative_labels to compute P(z) from current_merged_df.")
 
+        if no_op_iters >= max(1, int(config.noop_patience)):
+            logging.info(
+                "Stopping early after %s consecutive no-op iterations (noop_patience=%s).",
+                no_op_iters,
+                config.noop_patience,
+            )
+            break
+
     final_iter_count = iter_idx + 1 if max_iters > 0 and 'iter_idx' in locals() and iter_idx is not None else 0
+    if iteration_metrics_rows:
+        metrics_df = pd.DataFrame(iteration_metrics_rows).sort_values("iter").reset_index(drop=True)
+        for metric_col in ["logL_total", "avg_logL_per_token", "AIC", "BIC", "PPL", "PPL_tok", "ELBO", "mismatch_rate", "pmax_median", "entropy_median"]:
+            if metric_col in metrics_df.columns:
+                metrics_df[f"delta_{metric_col}"] = metrics_df[metric_col].diff()
+
+        display_cols = [
+            "iter", "clusters", "splits", "merges", "removes", "adds", "revises", "accepted",
+            "mismatch_rate", "pmax_median", "entropy_median",
+            "logL_total", "avg_logL_per_token", "AIC", "BIC", "PPL_tok", "ELBO",
+            "delta_logL_total", "delta_avg_logL_per_token", "delta_AIC", "delta_BIC", "delta_PPL_tok", "delta_ELBO",
+        ]
+        display_cols = [c for c in display_cols if c in metrics_df.columns]
+        logging.info(
+            "Iteration metrics summary (better: logL_total/avg_logL_tok/ELBO higher; AIC/BIC/PPL_tok/mismatch/entropy lower; pmax higher):\n%s",
+            metrics_df[display_cols].to_string(
+                index=False,
+                float_format=lambda x: f"{x:.6g}",
+            ),
+        )
+
+        best_logl_iter = int(metrics_df.loc[metrics_df["logL_total"].idxmax(), "iter"])
+        best_tokll_iter = int(metrics_df.loc[metrics_df["avg_logL_per_token"].idxmax(), "iter"])
+        best_aic_iter = int(metrics_df.loc[metrics_df["AIC"].idxmin(), "iter"])
+        best_bic_iter = int(metrics_df.loc[metrics_df["BIC"].idxmin(), "iter"])
+        best_ppl_iter = int(metrics_df.loc[metrics_df["PPL_tok"].idxmin(), "iter"])
+        best_elbo_iter = int(metrics_df.loc[metrics_df["ELBO"].idxmax(), "iter"])
+        logging.info(
+            "Best-iteration summary: logL_total=iter%s, avg_logL_tok=iter%s, AIC=iter%s, BIC=iter%s, PPL_tok=iter%s, ELBO=iter%s",
+            best_logl_iter,
+            best_tokll_iter,
+            best_aic_iter,
+            best_bic_iter,
+            best_ppl_iter,
+            best_elbo_iter,
+        )
+
+        if diagnostics_dir is not None:
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            summary_csv = diagnostics_dir / "em_iteration_metrics_summary.csv"
+            metrics_df.to_csv(summary_csv, index=False)
+            logging.info("Saved iteration metrics summary CSV to: %s", summary_csv)
+    elif log_iteration_metrics:
+        logging.info("Iteration metrics summary unavailable: no completed iterations with metric logging.")
+
     logging.info(f"EM schema refinement finished after {final_iter_count} iterations.")
     return current_merged_df, schema_history, current_choices_list, current_prob_calibrator
 
 
 def main(args):
     setup_logging()
+
+    args.tune_operation = str(args.tune_operation).lower()
+    if args.tune_operation not in VALID_TUNE_OPERATIONS:
+        raise ValueError(f"Invalid tune operation '{args.tune_operation}'. Expected one of {VALID_TUNE_OPERATIONS}.")
 
     if args.model_type == "openai":
         raise ValueError(
@@ -1521,8 +2315,18 @@ def main(args):
 
     # 3.5 Subsample data if requested
     if args.num_datapoints_per_cluster is not None:
-        logging.info(f"Subsampling to {args.num_datapoints_per_cluster} datapoints per cluster.")
-        merged_df = merged_df.groupby('cluster_id').sample(n=args.num_datapoints_per_cluster, replace=True)
+        sample_seed = args.subsample_seed if args.subsample_seed is not None and args.subsample_seed >= 0 else None
+        logging.info(
+            "Subsampling to up to %s datapoints per cluster (replace=False, seed=%s).",
+            args.num_datapoints_per_cluster,
+            sample_seed,
+        )
+        sampled_groups = []
+        for cluster_id, group in merged_df.groupby("cluster_id", sort=False):
+            n_take = min(int(args.num_datapoints_per_cluster), len(group))
+            random_state = None if sample_seed is None else int(sample_seed + int(cluster_id))
+            sampled_groups.append(group.sample(n=n_take, replace=False, random_state=random_state))
+        merged_df = pd.concat(sampled_groups, axis=0).sort_index()
         # Reset index so embeddings align with row positions after subsampling.
         merged_df = merged_df.reset_index(drop=True)
         logging.info(f"  Number of datapoints after subsampling: {len(merged_df)}")
@@ -1542,13 +2346,45 @@ def main(args):
     if args.num_iterations > 0:
         diagnostics_dir = Path(args.diagnostics_dir) if args.diagnostics_dir else Path(args.experiment_dir) / "em_diagnostics"
         config = SchemaRefinementConfig(
-            enable_splits=args.enable_splits,
-            max_splits_per_iter=args.max_splits_per_iter,
-            min_cluster_size_for_split=args.min_cluster_size_for_split,
-            split_L_margin=args.split_L_margin,
-            split_C_thresh=args.split_C_thresh,
-            min_gap_median_for_split=args.min_gap_median_for_split,
-            cooldown_iters_after_split=args.cooldown_iters_after_split,
+            tune_operation=args.tune_operation,
+            split_enabled=args.split_enabled,
+            split_max_per_iter=args.split_max_per_iter,
+            split_min_cluster_size=args.split_min_cluster_size,
+            split_ll_margin=args.split_ll_margin,
+            split_confidence_max=args.split_confidence_max,
+            split_gap_median_min=args.split_gap_median_min,
+            split_min_conditions=args.split_min_conditions,
+            split_cooldown_iters=args.split_cooldown_iters,
+            merge_enabled=args.merge_enabled,
+            merge_max_per_iter=args.merge_max_per_iter,
+            merge_similarity_min=args.merge_similarity_min,
+            merge_l_diff_ratio_max=args.merge_l_diff_ratio_max,
+            merge_c_diff_ratio_max=args.merge_c_diff_ratio_max,
+            merge_min_conditions=args.merge_min_conditions,
+            remove_enabled=args.remove_enabled,
+            remove_max_per_iter=args.remove_max_per_iter,
+            remove_min_cluster_size=args.remove_min_cluster_size,
+            remove_ll_factor=args.remove_ll_factor,
+            revise_enabled=args.revise_enabled,
+            revise_max_per_iter=args.revise_max_per_iter,
+            revise_ll_margin=args.revise_ll_margin,
+            revise_confidence_max=args.revise_confidence_max,
+            revise_min_conditions=args.revise_min_conditions,
+            revise_cooldown_iters=args.revise_cooldown_iters,
+            add_enabled=args.add_enabled,
+            add_low_confidence_max=args.add_low_confidence_max,
+            add_low_confidence_quantile=args.add_low_confidence_quantile,
+            add_min_poorly_explained=args.add_min_poorly_explained,
+            add_items_per_new_cluster=args.add_items_per_new_cluster,
+            add_max_new_clusters_per_iter=args.add_max_new_clusters_per_iter,
+            add_max_total_clusters=args.add_max_total_clusters,
+            add_min_group_size=args.add_min_group_size,
+            add_entropy_min=args.add_entropy_min,
+            add_cohesion_min=args.add_cohesion_min,
+            add_cooldown_iters=args.add_cooldown_iters,
+            rollback_on_metric_degrade=args.rollback_on_metric_degrade,
+            accept_min_delta=args.accept_min_delta,
+            noop_patience=args.noop_patience,
         )
         merged_df, schema_history, choices_list, prob_calibrator = em_schema_refinement(
             merged_df,
@@ -1568,9 +2404,6 @@ def main(args):
             diagnostics_sample_size=args.diagnostics_sample_size,
             diagnostics_bins=args.diagnostics_bins,
             diagnostics_dir=diagnostics_dir,
-            low_confidence_threshold_add=args.low_confidence_threshold_add,
-            min_poorly_explained_for_add=args.min_poorly_explained_for_add,
-            items_per_new_cluster_add=args.items_per_new_cluster_add,
             config=config,
         )
         logging.info(f"EM schema refinement completed. Schema history: {schema_history}")
@@ -1627,6 +2460,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=3, help="Number of iterations for EM-style schema refinement.")
     parser.add_argument("--embedding_model_name", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Name of the embedding model for EM-style schema refinement.")
     parser.add_argument("--num_datapoints_per_cluster", type=int, default=None, help="Number of datapoints to sample per cluster.")
+    parser.add_argument("--subsample_seed", type=int, default=13, help="Seed for per-cluster subsampling. Use -1 for non-deterministic sampling.")
     parser.add_argument("--baseline_sample_size", type=int, default=DEFAULT_BASELINE_SAMPLE_SIZE, help="Sample size for calculating baseline P(x) during EM refinement.")
     parser.add_argument("--max_texts_per_cluster_metrics", type=int, default=DEFAULT_MAX_TEXTS_PER_CLUSTER_METRICS, help="Max texts per cluster to use for metrics calculation (-1 for no limit).")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging of probabilities at each EM iteration.")
@@ -1636,17 +2470,87 @@ if __name__ == "__main__":
     parser.add_argument("--diagnostics_sample_size", type=int, default=200, help="Number of rows to sample for probability diagnostics per iteration.")
     parser.add_argument("--diagnostics_bins", type=int, default=40, help="Histogram bins for diagnostics plots.")
     parser.add_argument("--diagnostics_dir", type=str, default="", help="Output directory for EM diagnostics (defaults to <experiment_dir>/em_diagnostics).")
-    parser.add_argument("--low_confidence_threshold_add", type=float, default=LOW_CONFIDENCE_THRESHOLD_ADD, help="Add-step threshold on max p(z|x). Higher values mark more rows as poorly explained.")
-    parser.add_argument("--min_poorly_explained_for_add", type=int, default=MIN_POORLY_EXPLAINED_FOR_ADD, help="Minimum poorly explained rows needed before creating new clusters.")
-    parser.add_argument("--items_per_new_cluster_add", type=int, default=ITEMS_PER_NEW_CLUSTER_ADD, help="Heuristic scale: one new cluster per this many poorly explained rows.")
-    # Split gating config
-    parser.add_argument("--enable_splits", action="store_true", help="Enable split operations (default: disabled).")
-    parser.add_argument("--max_splits_per_iter", type=int, default=1)
-    parser.add_argument("--min_cluster_size_for_split", type=int, default=20)
-    parser.add_argument("--split_L_margin", type=float, default=8.0)
-    parser.add_argument("--split_C_thresh", type=float, default=0.20)
-    parser.add_argument("--min_gap_median_for_split", type=float, default=0.15)
-    parser.add_argument("--cooldown_iters_after_split", type=int, default=1)
+
+    parser.add_argument(
+        "--tune_operation",
+        type=str,
+        choices=list(VALID_TUNE_OPERATIONS),
+        default="all",
+        help="Run all operations or isolate one operation for threshold tuning.",
+    )
+
+    # Split config
+    parser.add_argument(
+        "--split_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable split operation logic.",
+    )
+    parser.add_argument("--split_max_per_iter", type=int, default=1)
+    parser.add_argument("--split_min_cluster_size", type=int, default=20)
+    parser.add_argument("--split_ll_margin", type=float, default=6.0)
+    parser.add_argument("--split_confidence_max", type=float, default=0.30)
+    parser.add_argument("--split_gap_median_min", type=float, default=0.10)
+    parser.add_argument("--split_min_conditions", type=int, default=1, help="Min number of split conditions that must pass (L_z/C_z/gap) once base gates pass.")
+    parser.add_argument("--split_cooldown_iters", type=int, default=1)
+
+    # Merge config
+    parser.add_argument(
+        "--merge_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable merge operation logic.",
+    )
+    parser.add_argument("--merge_max_per_iter", type=int, default=1)
+    parser.add_argument("--merge_similarity_min", type=float, default=0.80)
+    parser.add_argument("--merge_l_diff_ratio_max", type=float, default=0.10)
+    parser.add_argument("--merge_c_diff_ratio_max", type=float, default=0.10)
+    parser.add_argument("--merge_min_conditions", type=int, default=1, help="Min number of merge conditions that must pass (similarity/L_ratio/C_ratio).")
+
+    # Remove config
+    parser.add_argument(
+        "--remove_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable remove operation logic.",
+    )
+    parser.add_argument("--remove_max_per_iter", type=int, default=0, help="0 means no cap.")
+    parser.add_argument("--remove_min_cluster_size", type=int, default=5)
+    parser.add_argument("--remove_ll_factor", type=float, default=1.01)
+
+    # Revise config
+    parser.add_argument(
+        "--revise_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable revise operation logic (relabel low-quality clusters without reassigning datapoints).",
+    )
+    parser.add_argument("--revise_max_per_iter", type=int, default=1, help="0 means no cap.")
+    parser.add_argument("--revise_ll_margin", type=float, default=4.0)
+    parser.add_argument("--revise_confidence_max", type=float, default=0.25)
+    parser.add_argument("--revise_min_conditions", type=int, default=1, help="Min number of revise conditions that must pass (L_z/C_z).")
+    parser.add_argument("--revise_cooldown_iters", type=int, default=1)
+
+    # Add config
+    parser.add_argument(
+        "--add_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable add operation logic.",
+    )
+    parser.add_argument("--add_low_confidence_max", type=float, default=0.20)
+    parser.add_argument("--add_low_confidence_quantile", type=float, default=0.05, help="Dynamic low-confidence quantile for add-step; threshold uses max(fixed, quantile).")
+    parser.add_argument("--add_min_poorly_explained", type=int, default=5)
+    parser.add_argument("--add_items_per_new_cluster", type=int, default=50)
+    parser.add_argument("--add_max_new_clusters_per_iter", type=int, default=3)
+    parser.add_argument("--add_max_total_clusters", type=int, default=200)
+    parser.add_argument("--add_min_group_size", type=int, default=4)
+    parser.add_argument("--add_entropy_min", type=float, default=0.90)
+    parser.add_argument("--add_cohesion_min", type=float, default=0.15)
+    parser.add_argument("--add_cooldown_iters", type=int, default=1)
+    parser.add_argument("--rollback_on_metric_degrade", action=argparse.BooleanOptionalAction, default=True, help="Rollback iteration updates when avg_logL_per_token degrades.")
+    parser.add_argument("--accept_min_delta", type=float, default=0.0, help="Minimum avg_logL_per_token delta required to accept an iteration update.")
+    parser.add_argument("--noop_patience", type=int, default=2, help="Early-stop after this many consecutive no-op iterations.")
 
     args = parser.parse_args()
     main(args)

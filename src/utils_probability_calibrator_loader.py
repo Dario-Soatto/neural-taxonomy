@@ -508,6 +508,12 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
         
         return log_prob_sum
     
+    # Expose the shared vLLM objects so downstream code can reuse the same engine
+    # (e.g., cluster relabeling) without attempting a second model load.
+    for fn in (choice_log_prob_sums_single, choice_log_prob_sums_batch, full_text_log_prob_sum):
+        setattr(fn, "_vllm_llm", llm)
+        setattr(fn, "_vllm_tokenizer", tokenizer)
+
     return choice_log_prob_sums_single, choice_log_prob_sums_batch, full_text_log_prob_sum
 
 if __name__ == "__main__":

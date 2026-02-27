@@ -184,8 +184,14 @@ def compute_corpus_level_scores(
 
     if token_counts is None:
         token_counts = np.ones(N)
+    token_counts = np.asarray(token_counts, dtype=float)
+    if token_counts.shape[0] != N:
+        raise ValueError(
+            f"token_counts length ({token_counts.shape[0]}) must match number of rows ({N})."
+        )
     T = float(np.sum(token_counts))
-    ppl = float(np.exp(- np.sum(log_px_given_z_hat) / max(T, 1.0)))
+    avg_logL_per_token = float(logL / max(T, 1.0))
+    ppl = float(np.exp(-avg_logL_per_token))
 
     elbo = None
     if q_ij is not None and log_px_given_z is not None and log_pz is not None:
@@ -199,8 +205,11 @@ def compute_corpus_level_scores(
 
     return {
         "logL_cond_total": logL,
+        "token_count_total": T,
+        "avg_logL_per_token": avg_logL_per_token,
         "AIC": aic,
         "BIC": bic,
         "perplexity": ppl,
+        "perplexity_token": ppl,
         "ELBO": elbo,
     }
