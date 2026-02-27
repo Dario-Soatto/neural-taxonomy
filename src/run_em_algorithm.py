@@ -11,7 +11,11 @@ import sys
 from tqdm import tqdm
 from dataclasses import dataclass
 
-from em_scores import compute_document_level_scores, compute_corpus_level_scores, bayes_log_px_given_z
+from em_scores import (
+    compute_document_level_scores,
+    compute_corpus_level_scores_variants,
+    bayes_log_px_given_z,
+)
 from em_diagnostics_utils import compute_posterior_diagnostics
 from schema_utils import (
     SchemaState,
@@ -26,6 +30,7 @@ from schema_utils import (
 
 # --- EM Refinement Constants ---
 VALID_TUNE_OPERATIONS = ("all", "split", "merge", "remove", "add", "revise")
+VALID_ACCEPT_METRICS = ("assigned", "soft", "oracle")
 DUP_LABEL_SIM_THRESHOLD = 0.90   # Near-duplicate label similarity threshold
 
 
@@ -74,6 +79,7 @@ class SchemaRefinementConfig:
     add_cooldown_iters: int = 1
 
     rollback_on_metric_degrade: bool = True
+    accept_metric: str = "assigned"
     accept_min_delta: float = 0.0
     noop_patience: int = 2
 
@@ -1414,6 +1420,10 @@ def em_schema_refinement(
     """Run an EM-like schema refinement loop, returning updated merged_df and history of schema changes."""
     if config is None:
         config = SchemaRefinementConfig()
+    if config.accept_metric not in VALID_ACCEPT_METRICS:
+        raise ValueError(
+            f"Invalid accept_metric '{config.accept_metric}'. Expected one of {VALID_ACCEPT_METRICS}."
+        )
     logging.info(
         "Operation config: tune_operation=%s | split=%s merge=%s remove=%s add=%s revise=%s",
         config.tune_operation,
@@ -1449,6 +1459,29 @@ def em_schema_refinement(
             logging.warning("Could not load tokenizer for token-count-aware metrics: %s. Falling back to whitespace token counts.", exc)
     elif token_count_tokenizer is None:
         logging.warning("No model tokenizer handle available for token counts. Falling back to whitespace token counts.")
+
+    def _compute_variant_metrics(df_for_metrics: pd.DataFrame, schema_for_metrics: SchemaState):
+        doc_scores_local = compute_document_level_scores(
+            df=df_for_metrics,
+            text_col=text_column_name,
+            cluster_col="agglomerative_label",
+            choices=current_choices_list,
+            prob_calibrator=current_prob_calibrator,
+            embeddings=all_embeddings if 'all_embeddings' in locals() else None,
+            p_z_prior=schema_for_metrics.p_z_prior,
+        )
+        token_counts_local = estimate_token_counts(
+            df_for_metrics[text_column_name].astype(str).tolist(),
+            tokenizer=token_count_tokenizer,
+        )
+        corpus_scores_local = compute_corpus_level_scores_variants(
+            doc_scores=doc_scores_local,
+            token_counts=token_counts_local,
+            k_complexity=len(current_choices_list),
+            is_test_mask=None,
+        )
+        return doc_scores_local, token_counts_local, corpus_scores_local
+
     schema_history = []
     if current_merged_df['cluster_id'].empty:
         logging.warning("Initial merged_df has no cluster_id assignments. Starting new cluster IDs from 0.")
@@ -1458,7 +1491,7 @@ def em_schema_refinement(
     logging.info("Calculating baseline log p(x) for the dataset...")
     sample_size_for_baseline = min(baseline_sample_size, len(current_merged_df))
     baseline_log_px = 0.0 # Initialize baseline_log_px
-    accepted_avg_logL_per_token = None
+    accepted_avg_logL_per_token_by_variant = {m: None for m in VALID_ACCEPT_METRICS}
     if sample_size_for_baseline > 0:
         texts_for_baseline_sample = current_merged_df[text_column_name].sample(sample_size_for_baseline).tolist()
         baseline_log_px = current_prob_calibrator.compute_average_log_px_from_sample(texts_for_baseline_sample)
@@ -1466,42 +1499,28 @@ def em_schema_refinement(
         logging.info(f"Baseline log p(x) = {baseline_log_px:.4f} (based on {sample_size_for_baseline} samples)")
 
         # NEW: E-step scoring
-        doc_scores = compute_document_level_scores(
-            df=current_merged_df,
-            text_col=text_column_name,
-            cluster_col="agglomerative_label",
-            choices=current_choices_list,
-            prob_calibrator=current_prob_calibrator,
-            embeddings=all_embeddings if 'all_embeddings' in locals() else None,
-            p_z_prior=schema_state.p_z_prior,
-        )
-        token_counts = estimate_token_counts(
-            current_merged_df[text_column_name].astype(str).tolist(),
-            tokenizer=token_count_tokenizer,
+        doc_scores, token_counts, corpus_scores = _compute_variant_metrics(
+            current_merged_df,
+            schema_state,
         )
         # Persist per-row pmax / assignments for analysis
         current_merged_df["pmax_explained"] = doc_scores["row_pmax_posterior"]     
         current_merged_df["z_hat_explainer"] = doc_scores["row_z_hat"]   
 
-        # Optionally compute corpus scores (treat all as test or pass a mask)
-        corpus_scores = compute_corpus_level_scores(
-            log_px_given_z_hat=doc_scores["row_log_px_given_z"][np.arange(len(current_merged_df)),
-                                                                    current_merged_df["z_hat_explainer"].values],
-            token_counts=token_counts,
-            k_complexity=len(current_choices_list),  # simple complexity proxy
-            is_test_mask=None,
-            q_ij=doc_scores["PZX"],
-            log_px_given_z=doc_scores["row_log_px_given_z"],
-            log_pz=np.log(np.clip(doc_scores["pz_prior"], 1e-30, None)),
-        )  
-
         logging.info(f"[E-step] L_baseline={doc_scores['L_baseline']:.4f}, "
-                    f"logL_total={corpus_scores['logL_cond_total']:.2f}, "
-                    f"avg_logL_tok={corpus_scores['avg_logL_per_token']:.6f}, "
+                    f"logL_total_oracle={corpus_scores['logL_total_oracle']:.2f}, "
+                    f"avg_logL_tok_oracle={corpus_scores['avg_logL_per_token_oracle']:.6f}, "
+                    f"avg_logL_tok_assigned={corpus_scores['avg_logL_per_token_assigned']:.6f}, "
+                    f"avg_logL_tok_soft={corpus_scores['avg_logL_per_token_soft']:.6f}, "
                     f"AIC={corpus_scores['AIC']}, BIC={corpus_scores['BIC']}, "
-                    f"PPL_tok={corpus_scores['perplexity_token']:.3f}, "
+                    f"PPL_tok_oracle={corpus_scores['perplexity_token_oracle']:.3f}, "
+                    f"PPL_tok_assigned={corpus_scores['perplexity_token_assigned']:.3f}, "
+                    f"PPL_tok_soft={corpus_scores['perplexity_token_soft']:.3f}, "
                     f"ELBO={corpus_scores['ELBO']}")  
-        accepted_avg_logL_per_token = float(corpus_scores["avg_logL_per_token"])
+        for variant in VALID_ACCEPT_METRICS:
+            accepted_avg_logL_per_token_by_variant[variant] = float(
+                corpus_scores[f"avg_logL_per_token_{variant}"]
+            )
     else:
         logging.warning(f"  Dataset is empty or too small for baseline sample, cannot compute baseline log p(x). Using {baseline_log_px}.")
 
@@ -1526,6 +1545,25 @@ def em_schema_refinement(
         prev_revise_cooldown = dict(revise_cooldown)
         prev_add_cooldown_until = add_cooldown_until
         prev_next_new_cluster_id = next_new_cluster_id
+        should_compute_iter_metrics = log_iteration_metrics or config.rollback_on_metric_degrade
+        pre_doc_scores_iter = None
+        pre_corpus_scores_iter = None
+        if should_compute_iter_metrics:
+            pre_doc_scores_iter, _, pre_corpus_scores_iter = _compute_variant_metrics(
+                current_merged_df,
+                schema_state,
+            )
+            logging.info(
+                "[Iter %s] PRE  avg_logL_tok: oracle=%.6f, assigned=%.6f, soft=%.6f | "
+                "PPL_tok: oracle=%.3f, assigned=%.3f, soft=%.3f",
+                iter_idx + 1,
+                float(pre_corpus_scores_iter["avg_logL_per_token_oracle"]),
+                float(pre_corpus_scores_iter["avg_logL_per_token_assigned"]),
+                float(pre_corpus_scores_iter["avg_logL_per_token_soft"]),
+                float(pre_corpus_scores_iter["perplexity_token_oracle"]),
+                float(pre_corpus_scores_iter["perplexity_token_assigned"]),
+                float(pre_corpus_scores_iter["perplexity_token_soft"]),
+            )
         logging.info(f"Iteration {iter_idx + 1}: Computing cluster metrics for {current_merged_df['cluster_id'].nunique()} clusters.")
         cluster_metrics = compute_cluster_metrics(
             current_merged_df, 
@@ -2053,41 +2091,34 @@ def em_schema_refinement(
             len(iteration_actions.get("revise", [])),
         )
 
-        should_compute_iter_metrics = log_iteration_metrics or config.rollback_on_metric_degrade
-        doc_scores_iter = None
-        corpus_scores_iter = None
+        post_doc_scores_iter = None
+        post_corpus_scores_iter = None
         if should_compute_iter_metrics:
-            doc_scores_iter = compute_document_level_scores(
-                df=current_merged_df,
-                text_col=text_column_name,
-                cluster_col="agglomerative_label",
-                choices=current_choices_list,
-                prob_calibrator=current_prob_calibrator,
-                embeddings=all_embeddings if 'all_embeddings' in locals() else None,
-                p_z_prior=getattr(current_prob_calibrator, "p_z", None),
-            )
-            token_counts_iter = estimate_token_counts(
-                current_merged_df[text_column_name].astype(str).tolist(),
-                tokenizer=token_count_tokenizer,
-            )
-            corpus_scores_iter = compute_corpus_level_scores(
-                log_px_given_z_hat=doc_scores_iter["row_log_px_given_z"][np.arange(len(current_merged_df)),
-                                                                            doc_scores_iter["row_z_hat"]],
-                token_counts=token_counts_iter,
-                k_complexity=len(current_choices_list),
-                is_test_mask=None,
-                q_ij=doc_scores_iter["PZX"],
-                log_px_given_z=doc_scores_iter["row_log_px_given_z"],
-                log_pz=np.log(np.clip(doc_scores_iter["pz_prior"], 1e-30, None)),
+            post_doc_scores_iter, _, post_corpus_scores_iter = _compute_variant_metrics(
+                current_merged_df,
+                schema_state,
             )
             logging.info(
-                f"[Iter {iter_idx + 1}] L_baseline={doc_scores_iter['L_baseline']:.4f}, "
-                f"logL_total={corpus_scores_iter['logL_cond_total']:.2f}, "
-                f"avg_logL_tok={corpus_scores_iter['avg_logL_per_token']:.6f}, "
-                f"AIC={corpus_scores_iter['AIC']}, BIC={corpus_scores_iter['BIC']}, "
-                f"PPL_tok={corpus_scores_iter['perplexity_token']:.3f}, "
-                f"ELBO={corpus_scores_iter['ELBO']}"
+                "[Iter %s] POST avg_logL_tok: oracle=%.6f, assigned=%.6f, soft=%.6f | "
+                "PPL_tok: oracle=%.3f, assigned=%.3f, soft=%.3f",
+                iter_idx + 1,
+                float(post_corpus_scores_iter["avg_logL_per_token_oracle"]),
+                float(post_corpus_scores_iter["avg_logL_per_token_assigned"]),
+                float(post_corpus_scores_iter["avg_logL_per_token_soft"]),
+                float(post_corpus_scores_iter["perplexity_token_oracle"]),
+                float(post_corpus_scores_iter["perplexity_token_assigned"]),
+                float(post_corpus_scores_iter["perplexity_token_soft"]),
             )
+            if pre_corpus_scores_iter is not None:
+                logging.info(
+                    "[Iter %s] DELTA (POST-PRE) %s avg_logL_tok=%.6f",
+                    iter_idx + 1,
+                    config.accept_metric,
+                    float(
+                        post_corpus_scores_iter[f"avg_logL_per_token_{config.accept_metric}"]
+                        - pre_corpus_scores_iter[f"avg_logL_per_token_{config.accept_metric}"]
+                    ),
+                )
 
         proposed_action_count = int(
             len(iteration_actions.get("split", []))
@@ -2098,18 +2129,23 @@ def em_schema_refinement(
         )
         accepted_update = True
         metric_delta = np.nan
+        accept_metric_key = f"avg_logL_per_token_{config.accept_metric}"
         if (
             config.rollback_on_metric_degrade
-            and corpus_scores_iter is not None
-            and accepted_avg_logL_per_token is not None
+            and post_corpus_scores_iter is not None
+            and accepted_avg_logL_per_token_by_variant.get(config.accept_metric) is not None
             and proposed_action_count > 0
         ):
-            metric_delta = float(corpus_scores_iter["avg_logL_per_token"] - accepted_avg_logL_per_token)
+            metric_delta = float(
+                post_corpus_scores_iter[accept_metric_key]
+                - accepted_avg_logL_per_token_by_variant[config.accept_metric]
+            )
             if metric_delta < float(config.accept_min_delta):
                 accepted_update = False
                 logging.warning(
-                    "Iteration %s rejected: avg_logL_per_token delta %.6f < min_delta %.6f. Rolling back schema updates.",
+                    "Iteration %s rejected: avg_logL_per_token_%s delta %.6f < min_delta %.6f. Rolling back schema updates.",
                     iter_idx + 1,
+                    config.accept_metric,
                     metric_delta,
                     float(config.accept_min_delta),
                 )
@@ -2125,6 +2161,8 @@ def em_schema_refinement(
                 unique_cluster_ids_after_iter = sorted(current_merged_df["cluster_id"].unique())
                 iteration_actions["accepted"] = False
                 iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                iteration_actions["metric_delta_accept_metric"] = metric_delta
+                iteration_actions["accept_metric"] = config.accept_metric
                 iteration_actions["proposed_actions"] = {
                     "split": iteration_actions.get("split", []),
                     "merge": iteration_actions.get("merge", []),
@@ -2139,45 +2177,54 @@ def em_schema_refinement(
                 iteration_actions["revise"] = []
                 proposed_action_count = 0
                 if should_compute_iter_metrics:
-                    doc_scores_iter = compute_document_level_scores(
-                        df=current_merged_df,
-                        text_col=text_column_name,
-                        cluster_col="agglomerative_label",
-                        choices=current_choices_list,
-                        prob_calibrator=current_prob_calibrator,
-                        embeddings=all_embeddings if 'all_embeddings' in locals() else None,
-                        p_z_prior=getattr(current_prob_calibrator, "p_z", None),
+                    post_doc_scores_iter, _, post_corpus_scores_iter = _compute_variant_metrics(
+                        current_merged_df,
+                        schema_state,
                     )
-                    token_counts_iter = estimate_token_counts(
-                        current_merged_df[text_column_name].astype(str).tolist(),
-                        tokenizer=token_count_tokenizer,
-                    )
-                    corpus_scores_iter = compute_corpus_level_scores(
-                        log_px_given_z_hat=doc_scores_iter["row_log_px_given_z"][np.arange(len(current_merged_df)),
-                                                                                    doc_scores_iter["row_z_hat"]],
-                        token_counts=token_counts_iter,
-                        k_complexity=len(current_choices_list),
-                        is_test_mask=None,
-                        q_ij=doc_scores_iter["PZX"],
-                        log_px_given_z=doc_scores_iter["row_log_px_given_z"],
-                        log_pz=np.log(np.clip(doc_scores_iter["pz_prior"], 1e-30, None)),
-                    )
+                    if pre_corpus_scores_iter is not None:
+                        logging.info(
+                            "[Iter %s] POST (after rollback) avg_logL_tok: oracle=%.6f, assigned=%.6f, soft=%.6f",
+                            iter_idx + 1,
+                            float(post_corpus_scores_iter["avg_logL_per_token_oracle"]),
+                            float(post_corpus_scores_iter["avg_logL_per_token_assigned"]),
+                            float(post_corpus_scores_iter["avg_logL_per_token_soft"]),
+                        )
                 no_op_iters += 1
             else:
-                accepted_avg_logL_per_token = float(corpus_scores_iter["avg_logL_per_token"])
+                for variant in VALID_ACCEPT_METRICS:
+                    accepted_avg_logL_per_token_by_variant[variant] = float(
+                        post_corpus_scores_iter[f"avg_logL_per_token_{variant}"]
+                    )
                 iteration_actions["accepted"] = True
                 iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                iteration_actions["metric_delta_accept_metric"] = metric_delta
+                iteration_actions["accept_metric"] = config.accept_metric
                 no_op_iters = 0
         else:
             iteration_actions["accepted"] = True
-            if proposed_action_count > 0 and corpus_scores_iter is not None:
-                accepted_avg_logL_per_token = float(corpus_scores_iter["avg_logL_per_token"])
+            if proposed_action_count > 0 and post_corpus_scores_iter is not None:
+                for variant in VALID_ACCEPT_METRICS:
+                    accepted_avg_logL_per_token_by_variant[variant] = float(
+                        post_corpus_scores_iter[f"avg_logL_per_token_{variant}"]
+                    )
             if proposed_action_count == 0:
                 no_op_iters += 1
             else:
                 no_op_iters = 0
 
-        if log_iteration_metrics and corpus_scores_iter is not None:
+        if log_iteration_metrics and post_corpus_scores_iter is not None:
+            delta_prepost_oracle = (
+                float(post_corpus_scores_iter["avg_logL_per_token_oracle"] - pre_corpus_scores_iter["avg_logL_per_token_oracle"])
+                if pre_corpus_scores_iter is not None else np.nan
+            )
+            delta_prepost_assigned = (
+                float(post_corpus_scores_iter["avg_logL_per_token_assigned"] - pre_corpus_scores_iter["avg_logL_per_token_assigned"])
+                if pre_corpus_scores_iter is not None else np.nan
+            )
+            delta_prepost_soft = (
+                float(post_corpus_scores_iter["avg_logL_per_token_soft"] - pre_corpus_scores_iter["avg_logL_per_token_soft"])
+                if pre_corpus_scores_iter is not None else np.nan
+            )
             iteration_metrics_rows.append({
                 "iter": int(iter_idx + 1),
                 "clusters": int(len(unique_cluster_ids_after_iter)),
@@ -2186,20 +2233,53 @@ def em_schema_refinement(
                 "removes": int(len(iteration_actions.get("remove", []))),
                 "adds": int(len(iteration_actions.get("add", []))),
                 "revises": int(len(iteration_actions.get("revise", []))),
+                "accept_metric": config.accept_metric,
                 "accepted": bool(iteration_actions.get("accepted", True)),
                 "delta_vs_best_avg_logL_tok": metric_delta,
+                "delta_vs_best_accept_metric": metric_delta,
                 "mismatch_rate": float(diag_summary["mismatch_rate"]) if diag_summary and diag_summary.get("mismatch_rate") is not None else np.nan,
                 "pmax_median": float(diag_summary["pmax_median"]) if diag_summary and diag_summary.get("pmax_median") is not None else np.nan,
                 "entropy_median": float(diag_summary["entropy_median"]) if diag_summary and diag_summary.get("entropy_median") is not None else np.nan,
-                "L_baseline": float(doc_scores_iter["L_baseline"]),
-                "logL_total": float(corpus_scores_iter["logL_cond_total"]),
-                "token_count_total": float(corpus_scores_iter["token_count_total"]),
-                "avg_logL_per_token": float(corpus_scores_iter["avg_logL_per_token"]),
-                "AIC": float(corpus_scores_iter["AIC"]),
-                "BIC": float(corpus_scores_iter["BIC"]),
-                "PPL": float(corpus_scores_iter["perplexity"]),
-                "PPL_tok": float(corpus_scores_iter["perplexity_token"]),
-                "ELBO": float(corpus_scores_iter["ELBO"]),
+                "L_baseline": float(post_doc_scores_iter["L_baseline"]),
+                "token_count_total": float(post_corpus_scores_iter["token_count_total"]),
+                "pre_avg_logL_per_token_oracle": float(pre_corpus_scores_iter["avg_logL_per_token_oracle"]) if pre_corpus_scores_iter is not None else np.nan,
+                "pre_avg_logL_per_token_assigned": float(pre_corpus_scores_iter["avg_logL_per_token_assigned"]) if pre_corpus_scores_iter is not None else np.nan,
+                "pre_avg_logL_per_token_soft": float(pre_corpus_scores_iter["avg_logL_per_token_soft"]) if pre_corpus_scores_iter is not None else np.nan,
+                "pre_PPL_tok_oracle": float(pre_corpus_scores_iter["perplexity_token_oracle"]) if pre_corpus_scores_iter is not None else np.nan,
+                "pre_PPL_tok_assigned": float(pre_corpus_scores_iter["perplexity_token_assigned"]) if pre_corpus_scores_iter is not None else np.nan,
+                "pre_PPL_tok_soft": float(pre_corpus_scores_iter["perplexity_token_soft"]) if pre_corpus_scores_iter is not None else np.nan,
+                "logL_total_oracle": float(post_corpus_scores_iter["logL_total_oracle"]),
+                "logL_total_assigned": float(post_corpus_scores_iter["logL_total_assigned"]),
+                "logL_total_soft": float(post_corpus_scores_iter["logL_total_soft"]),
+                "avg_logL_per_token_oracle": float(post_corpus_scores_iter["avg_logL_per_token_oracle"]),
+                "avg_logL_per_token_assigned": float(post_corpus_scores_iter["avg_logL_per_token_assigned"]),
+                "avg_logL_per_token_soft": float(post_corpus_scores_iter["avg_logL_per_token_soft"]),
+                "PPL_tok_oracle": float(post_corpus_scores_iter["perplexity_token_oracle"]),
+                "PPL_tok_assigned": float(post_corpus_scores_iter["perplexity_token_assigned"]),
+                "PPL_tok_soft": float(post_corpus_scores_iter["perplexity_token_soft"]),
+                "delta_prepost_avg_logL_per_token_oracle": delta_prepost_oracle,
+                "delta_prepost_avg_logL_per_token_assigned": delta_prepost_assigned,
+                "delta_prepost_avg_logL_per_token_soft": delta_prepost_soft,
+                "delta_prepost_PPL_tok_oracle": (
+                    float(post_corpus_scores_iter["perplexity_token_oracle"] - pre_corpus_scores_iter["perplexity_token_oracle"])
+                    if pre_corpus_scores_iter is not None else np.nan
+                ),
+                "delta_prepost_PPL_tok_assigned": (
+                    float(post_corpus_scores_iter["perplexity_token_assigned"] - pre_corpus_scores_iter["perplexity_token_assigned"])
+                    if pre_corpus_scores_iter is not None else np.nan
+                ),
+                "delta_prepost_PPL_tok_soft": (
+                    float(post_corpus_scores_iter["perplexity_token_soft"] - pre_corpus_scores_iter["perplexity_token_soft"])
+                    if pre_corpus_scores_iter is not None else np.nan
+                ),
+                # Backward-compatible aliases (oracle).
+                "logL_total": float(post_corpus_scores_iter["logL_cond_total"]),
+                "avg_logL_per_token": float(post_corpus_scores_iter["avg_logL_per_token"]),
+                "AIC": float(post_corpus_scores_iter["AIC"]) if post_corpus_scores_iter["AIC"] is not None else np.nan,
+                "BIC": float(post_corpus_scores_iter["BIC"]) if post_corpus_scores_iter["BIC"] is not None else np.nan,
+                "PPL": float(post_corpus_scores_iter["perplexity"]),
+                "PPL_tok": float(post_corpus_scores_iter["perplexity_token"]),
+                "ELBO": float(post_corpus_scores_iter["ELBO"]),
             })
         schema_history.append(iteration_actions)
         logging.info(f"=== EM Iteration {iter_idx + 1} Complete. #Clusters: {len(unique_cluster_ids_after_iter)} ===")
@@ -2225,14 +2305,37 @@ def em_schema_refinement(
     final_iter_count = iter_idx + 1 if max_iters > 0 and 'iter_idx' in locals() and iter_idx is not None else 0
     if iteration_metrics_rows:
         metrics_df = pd.DataFrame(iteration_metrics_rows).sort_values("iter").reset_index(drop=True)
-        for metric_col in ["logL_total", "avg_logL_per_token", "AIC", "BIC", "PPL", "PPL_tok", "ELBO", "mismatch_rate", "pmax_median", "entropy_median"]:
+        for metric_col in [
+            "logL_total",
+            "logL_total_oracle",
+            "logL_total_assigned",
+            "logL_total_soft",
+            "avg_logL_per_token",
+            "avg_logL_per_token_oracle",
+            "avg_logL_per_token_assigned",
+            "avg_logL_per_token_soft",
+            "AIC",
+            "BIC",
+            "PPL",
+            "PPL_tok",
+            "PPL_tok_oracle",
+            "PPL_tok_assigned",
+            "PPL_tok_soft",
+            "ELBO",
+            "mismatch_rate",
+            "pmax_median",
+            "entropy_median",
+        ]:
             if metric_col in metrics_df.columns:
                 metrics_df[f"delta_{metric_col}"] = metrics_df[metric_col].diff()
 
         display_cols = [
-            "iter", "clusters", "splits", "merges", "removes", "adds", "revises", "accepted",
+            "iter", "clusters", "splits", "merges", "removes", "adds", "revises", "accepted", "accept_metric", "delta_vs_best_accept_metric",
             "mismatch_rate", "pmax_median", "entropy_median",
-            "logL_total", "avg_logL_per_token", "AIC", "BIC", "PPL_tok", "ELBO",
+            "logL_total_oracle", "logL_total_assigned", "logL_total_soft",
+            "avg_logL_per_token_oracle", "avg_logL_per_token_assigned", "avg_logL_per_token_soft",
+            "PPL_tok_oracle", "PPL_tok_assigned", "PPL_tok_soft",
+            "AIC", "BIC", "ELBO",
             "delta_logL_total", "delta_avg_logL_per_token", "delta_AIC", "delta_BIC", "delta_PPL_tok", "delta_ELBO",
         ]
         display_cols = [c for c in display_cols if c in metrics_df.columns]
@@ -2244,20 +2347,34 @@ def em_schema_refinement(
             ),
         )
 
-        best_logl_iter = int(metrics_df.loc[metrics_df["logL_total"].idxmax(), "iter"])
-        best_tokll_iter = int(metrics_df.loc[metrics_df["avg_logL_per_token"].idxmax(), "iter"])
+        best_logl_iter = int(metrics_df.loc[metrics_df["logL_total_oracle"].idxmax(), "iter"])
+        best_tokll_oracle_iter = int(metrics_df.loc[metrics_df["avg_logL_per_token_oracle"].idxmax(), "iter"])
+        best_tokll_assigned_iter = int(metrics_df.loc[metrics_df["avg_logL_per_token_assigned"].idxmax(), "iter"])
+        best_tokll_soft_iter = int(metrics_df.loc[metrics_df["avg_logL_per_token_soft"].idxmax(), "iter"])
         best_aic_iter = int(metrics_df.loc[metrics_df["AIC"].idxmin(), "iter"])
         best_bic_iter = int(metrics_df.loc[metrics_df["BIC"].idxmin(), "iter"])
-        best_ppl_iter = int(metrics_df.loc[metrics_df["PPL_tok"].idxmin(), "iter"])
+        best_ppl_oracle_iter = int(metrics_df.loc[metrics_df["PPL_tok_oracle"].idxmin(), "iter"])
+        best_ppl_assigned_iter = int(metrics_df.loc[metrics_df["PPL_tok_assigned"].idxmin(), "iter"])
+        best_ppl_soft_iter = int(metrics_df.loc[metrics_df["PPL_tok_soft"].idxmin(), "iter"])
         best_elbo_iter = int(metrics_df.loc[metrics_df["ELBO"].idxmax(), "iter"])
+        accept_metric_col = f"avg_logL_per_token_{config.accept_metric}"
+        best_accept_iter = int(metrics_df.loc[metrics_df[accept_metric_col].idxmax(), "iter"])
         logging.info(
-            "Best-iteration summary: logL_total=iter%s, avg_logL_tok=iter%s, AIC=iter%s, BIC=iter%s, PPL_tok=iter%s, ELBO=iter%s",
+            "Best-iteration summary: logL_total_oracle=iter%s, avg_logL_tok_oracle=iter%s, avg_logL_tok_assigned=iter%s, avg_logL_tok_soft=iter%s, "
+            "PPL_tok_oracle=iter%s, PPL_tok_assigned=iter%s, PPL_tok_soft=iter%s, "
+            "AIC=iter%s, BIC=iter%s, ELBO=iter%s, accept_metric(%s)=iter%s",
             best_logl_iter,
-            best_tokll_iter,
+            best_tokll_oracle_iter,
+            best_tokll_assigned_iter,
+            best_tokll_soft_iter,
+            best_ppl_oracle_iter,
+            best_ppl_assigned_iter,
+            best_ppl_soft_iter,
             best_aic_iter,
             best_bic_iter,
-            best_ppl_iter,
             best_elbo_iter,
+            config.accept_metric,
+            best_accept_iter,
         )
 
         if diagnostics_dir is not None:
@@ -2383,6 +2500,7 @@ def main(args):
             add_cohesion_min=args.add_cohesion_min,
             add_cooldown_iters=args.add_cooldown_iters,
             rollback_on_metric_degrade=args.rollback_on_metric_degrade,
+            accept_metric=args.accept_metric,
             accept_min_delta=args.accept_min_delta,
             noop_patience=args.noop_patience,
         )
@@ -2548,8 +2666,9 @@ if __name__ == "__main__":
     parser.add_argument("--add_entropy_min", type=float, default=0.90)
     parser.add_argument("--add_cohesion_min", type=float, default=0.15)
     parser.add_argument("--add_cooldown_iters", type=int, default=1)
-    parser.add_argument("--rollback_on_metric_degrade", action=argparse.BooleanOptionalAction, default=True, help="Rollback iteration updates when avg_logL_per_token degrades.")
-    parser.add_argument("--accept_min_delta", type=float, default=0.0, help="Minimum avg_logL_per_token delta required to accept an iteration update.")
+    parser.add_argument("--rollback_on_metric_degrade", action=argparse.BooleanOptionalAction, default=True, help="Rollback iteration updates when the selected accept metric degrades.")
+    parser.add_argument("--accept_metric", type=str, choices=list(VALID_ACCEPT_METRICS), default="assigned", help="Metric variant used for rollback gating: assigned, soft, or oracle.")
+    parser.add_argument("--accept_min_delta", type=float, default=0.0, help="Minimum delta in the selected accept metric (avg_logL_per_token_<variant>) required to accept an iteration update.")
     parser.add_argument("--noop_patience", type=int, default=2, help="Early-stop after this many consecutive no-op iterations.")
 
     args = parser.parse_args()
