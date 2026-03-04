@@ -1,11 +1,25 @@
 # src/em_scores.py
 from __future__ import annotations
+import logging
 import numpy as np
 import pandas as pd
 from typing import Dict, List
 
+logger = logging.getLogger(__name__)
+
 def _safe_log(x: np.ndarray, eps: float = 1e-30) -> np.ndarray:
     return np.log(np.clip(x, eps, None))
+
+
+def _validate_token_counts(token_counts: np.ndarray | None, n_rows: int) -> np.ndarray:
+    if token_counts is None:
+        token_counts = np.ones(n_rows, dtype=float)
+    token_counts = np.asarray(token_counts, dtype=float)
+    if token_counts.shape[0] != n_rows:
+        raise ValueError(
+            f"token_counts length ({token_counts.shape[0]}) must match number of rows ({n_rows})."
+        )
+    return token_counts
 
 def bayes_log_px_given_z(
     p_z_given_x: np.ndarray,
@@ -182,13 +196,7 @@ def compute_corpus_level_scores(
         aic = 2 * k_complexity - 2 * test_logL
         bic = k_complexity * np.log(n_test) - 2 * test_logL
 
-    if token_counts is None:
-        token_counts = np.ones(N)
-    token_counts = np.asarray(token_counts, dtype=float)
-    if token_counts.shape[0] != N:
-        raise ValueError(
-            f"token_counts length ({token_counts.shape[0]}) must match number of rows ({N})."
-        )
+    token_counts = _validate_token_counts(token_counts, N)
     T = float(np.sum(token_counts))
     avg_logL_per_token = float(logL / max(T, 1.0))
     ppl = float(np.exp(-avg_logL_per_token))
@@ -213,3 +221,127 @@ def compute_corpus_level_scores(
         "perplexity_token": ppl,
         "ELBO": elbo,
     }
+
+
+def compute_corpus_level_scores_variants(
+    doc_scores: Dict,
+    token_counts: np.ndarray | None = None,
+    k_complexity: int | None = None,
+    is_test_mask: np.ndarray | None = None,
+) -> Dict:
+    """
+    Compute corpus-level conditional likelihood/perplexity under three routing variants:
+      - oracle: z_hat = argmax_z log p(x|z)
+      - assigned: currently assigned cluster index for each row
+      - soft: expectation under q_ij = P(z|x)
+
+    Existing keys are preserved and mapped to oracle for backward compatibility.
+    """
+    row_log_px_given_z = np.asarray(doc_scores["row_log_px_given_z"], dtype=float)
+    row_z_hat = np.asarray(doc_scores["row_z_hat"], dtype=int)
+    row_cluster_idx = np.asarray(doc_scores["row_cluster_idx"], dtype=int)
+    q_ij = np.asarray(doc_scores["PZX"], dtype=float)
+
+    if row_log_px_given_z.ndim != 2:
+        raise ValueError(f"row_log_px_given_z must be 2D (N,K), got shape {row_log_px_given_z.shape}.")
+    n_rows, n_choices = row_log_px_given_z.shape
+    if row_z_hat.shape[0] != n_rows:
+        raise ValueError(f"row_z_hat length ({row_z_hat.shape[0]}) must equal N ({n_rows}).")
+    if row_cluster_idx.shape[0] != n_rows:
+        raise ValueError(f"row_cluster_idx length ({row_cluster_idx.shape[0]}) must equal N ({n_rows}).")
+    if q_ij.shape != row_log_px_given_z.shape:
+        raise ValueError(
+            f"PZX shape ({q_ij.shape}) must match row_log_px_given_z shape ({row_log_px_given_z.shape})."
+        )
+
+    if np.any(row_cluster_idx < 0):
+        missing_rows = np.where(row_cluster_idx < 0)[0][:10].tolist()
+        raise ValueError(
+            "Found row_cluster_idx == -1 (missing label in choices; likely calibrator/schema mismatch). "
+            f"Example row indices: {missing_rows}"
+        )
+
+    token_counts = _validate_token_counts(token_counts, n_rows)
+    if is_test_mask is None:
+        is_test_mask = np.ones(n_rows, dtype=bool)
+    else:
+        is_test_mask = np.asarray(is_test_mask, dtype=bool)
+        if is_test_mask.shape[0] != n_rows:
+            raise ValueError(f"is_test_mask length ({is_test_mask.shape[0]}) must equal N ({n_rows}).")
+
+    row_ids = np.arange(n_rows)
+    row_ll_oracle = row_log_px_given_z[row_ids, row_z_hat]
+    row_ll_assigned = row_log_px_given_z[row_ids, row_cluster_idx]
+    row_ll_soft = np.sum(q_ij * row_log_px_given_z, axis=1)
+
+    # Oracle must upper-bound soft row-wise: max_z a_z >= E_q[a_z].
+    eps = 1e-8
+    row_diff = row_ll_soft - row_ll_oracle
+    max_violation = float(np.max(row_diff)) if row_diff.size else 0.0
+    if max_violation > eps:
+        max_row = int(np.argmax(row_diff))
+        logger.warning(
+            "Invariant warning: oracle row ll < soft row ll by %.6e at row %s "
+            "(oracle=%.6f, soft=%.6f, assigned_idx=%s, z_hat=%s).",
+            max_violation,
+            max_row,
+            float(row_ll_oracle[max_row]),
+            float(row_ll_soft[max_row]),
+            int(row_cluster_idx[max_row]),
+            int(row_z_hat[max_row]),
+        )
+
+    def _aggregate(row_ll: np.ndarray, suffix: str) -> dict:
+        logl_total = float(np.sum(row_ll))
+        token_total = float(np.sum(token_counts))
+        avg_logl_tok = float(logl_total / max(token_total, 1.0))
+        ppl_tok = float(np.exp(-avg_logl_tok))
+        out = {
+            f"logL_total_{suffix}": logl_total,
+            f"avg_logL_per_token_{suffix}": avg_logl_tok,
+            f"perplexity_token_{suffix}": ppl_tok,
+            f"perplexity_{suffix}": ppl_tok,
+        }
+        if k_complexity is not None:
+            test_logl = float(np.sum(row_ll[is_test_mask]))
+            n_test = int(np.sum(is_test_mask))
+            if n_test > 0:
+                out[f"AIC_{suffix}"] = float(2 * k_complexity - 2 * test_logl)
+                out[f"BIC_{suffix}"] = float(k_complexity * np.log(n_test) - 2 * test_logl)
+            else:
+                out[f"AIC_{suffix}"] = None
+                out[f"BIC_{suffix}"] = None
+        return out
+
+    metrics = {
+        "token_count_total": float(np.sum(token_counts)),
+    }
+    metrics.update(_aggregate(row_ll_oracle, "oracle"))
+    metrics.update(_aggregate(row_ll_assigned, "assigned"))
+    metrics.update(_aggregate(row_ll_soft, "soft"))
+
+    if metrics["perplexity_token_oracle"] > metrics["perplexity_token_soft"] + 1e-8:
+        max_row = int(np.argmax(row_diff)) if row_diff.size else -1
+        logger.warning(
+            "Invariant warning: PPL_tok_oracle (%.6f) > PPL_tok_soft (%.6f). "
+            "Max row soft-oracle diff at row %s is %.6e.",
+            float(metrics["perplexity_token_oracle"]),
+            float(metrics["perplexity_token_soft"]),
+            max_row,
+            max_violation,
+        )
+
+    log_pz = np.log(np.clip(np.asarray(doc_scores["pz_prior"], dtype=float), 1e-30, None))
+    log_q = _safe_log(q_ij)
+    elbo = float(np.sum(q_ij * (row_log_px_given_z + log_pz[None, :] - log_q)))
+    metrics["ELBO"] = elbo
+
+    # Backward-compatible aliases map to assigned variant.
+    metrics["logL_cond_total"] = metrics["logL_total_assigned"]
+    metrics["avg_logL_per_token"] = metrics["avg_logL_per_token_assigned"]
+    metrics["perplexity"] = metrics["perplexity_assigned"]
+    metrics["perplexity_token"] = metrics["perplexity_token_assigned"]
+    metrics["AIC"] = metrics.get("AIC_assigned")
+    metrics["BIC"] = metrics.get("BIC_assigned")
+
+    return metrics
