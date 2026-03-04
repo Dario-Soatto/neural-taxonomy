@@ -2113,12 +2113,25 @@ def em_schema_refinement(
                     metric_delta,
                     float(config.accept_min_delta),
                 )
+                # Record clusters whose splits were rejected so we can apply
+                # cooldown even after rollback — prevents the same cluster from
+                # being proposed again immediately on the next iteration.
+                rejected_split_cluster_ids = list(iteration_actions.get("split", []))
                 current_merged_df = prev_merged_df
                 schema_state = prev_schema_state
                 current_choices_list = prev_choices_list
                 current_prob_calibrator = prev_prob_calibrator
                 token_count_tokenizer = prev_token_count_tokenizer
                 split_cooldown = prev_split_cooldown
+                # Apply cooldown to rejected splits so they are not re-proposed
+                # immediately. Use the same cooldown length as accepted splits.
+                for _rejected_cid in rejected_split_cluster_ids:
+                    split_cooldown[_rejected_cid] = (iter_idx + 1) + config.split_cooldown_iters
+                    logging.info(
+                        "Rejected split: applying cooldown to cluster %s until iter %s.",
+                        _rejected_cid,
+                        split_cooldown[_rejected_cid],
+                    )
                 revise_cooldown = prev_revise_cooldown
                 add_cooldown_until = prev_add_cooldown_until
                 next_new_cluster_id = prev_next_new_cluster_id
