@@ -18,7 +18,7 @@ REPO_DIR="/nlp/scr/tdalmia/projects/neural-taxonomy"
 EXPERIMENT_DIR="experiments/wiki_biographies_10000"
 MODEL_NAME="meta-llama/Meta-Llama-3.1-8B-Instruct"
 EM_GRID_OPERATION="${EM_GRID_OPERATION:-add}"
-EM_GRID_PROFILE="${EM_GRID_PROFILE:-coarse}"
+EM_GRID_PROFILE="${EM_GRID_PROFILE:-structural}"
 EM_GRID_OUTPUT_ROOT="${EM_GRID_OUTPUT_ROOT:-${EXPERIMENT_DIR}/em_grid_search}"
 
 cd "${REPO_DIR}"
@@ -76,10 +76,13 @@ python src/em_threshold_grid_search.py \
   --num_trials 3 \
   --scorer_type batch \
   --num_iterations 5 \
+  --split_min_conditions 2 \
   --split_max_per_iter 0 \
   --split_cooldown_iters 0 \
+  --merge_min_conditions 2 \
   --merge_max_per_iter 0 \
   --remove_max_per_iter 0 \
+  --revise_min_conditions 2 \
   --revise_max_per_iter 0 \
   --revise_cooldown_iters 0 \
   --add_max_new_clusters_per_iter 50 \

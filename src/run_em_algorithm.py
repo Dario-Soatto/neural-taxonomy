@@ -31,6 +31,7 @@ from schema_utils import (
 # --- EM Refinement Constants ---
 VALID_TUNE_OPERATIONS = ("all", "split", "merge", "remove", "add", "revise")
 VALID_ACCEPT_METRICS = ("assigned", "soft", "oracle")
+VALID_STRUCTURAL_LABEL_MODES = ("semantic", "parent_relative")
 DUP_LABEL_SIM_THRESHOLD = 0.90   # Near-duplicate label similarity threshold
 
 
@@ -82,6 +83,11 @@ class SchemaRefinementConfig:
     accept_metric: str = "assigned"
     accept_min_delta: float = 0.0
     noop_patience: int = 2
+    best_operation_per_iteration: bool = False
+    max_same_operation_streak: int = 0
+    structural_label_mode: str = "semantic"
+    split_label_pair_attempts: int = 3
+    llm_label_max_attempts: int = 6
 
     def operation_enabled(self, operation_name: str) -> bool:
         if operation_name not in {"split", "merge", "remove", "add", "revise"}:
@@ -144,28 +150,29 @@ def build_unique_label_map(
 ) -> tuple[dict[int, str], list[str]]:
     """
     Ensure one unique textual label per cluster id.
-    If duplicate labels occur, append a stable cluster-id suffix.
+    If duplicate labels occur, append a human-readable variant suffix.
     """
     unique_label_map: dict[int, str] = {}
-    seen_labels: dict[str, int] = {}
+    used_labels: set[str] = set()
     choices: list[str] = []
 
     for cid in sorted(cluster_ids):
         base_label = sanitize_text(raw_label_map.get(cid, f"{fallback_prefix}_{cid}"))
         if not base_label:
             base_label = f"{fallback_prefix}_{cid}"
-        if base_label in seen_labels:
-            seen_labels[base_label] += 1
-            unique_label = f"{base_label}__c{cid}"
+        unique_label = base_label
+        if unique_label in used_labels:
+            variant_idx = 2
+            while f"{base_label} Variant {variant_idx}" in used_labels:
+                variant_idx += 1
+            unique_label = f"{base_label} Variant {variant_idx}"
             logging.warning(
                 "Duplicate cluster label '%s' detected. Using unique label '%s' for cluster_id=%s.",
                 base_label,
                 unique_label,
                 cid,
             )
-        else:
-            seen_labels[base_label] = 1
-            unique_label = base_label
+        used_labels.add(unique_label)
         unique_label_map[cid] = unique_label
         choices.append(build_label_string(unique_label))
 
@@ -564,7 +571,7 @@ def decide_schema_updates(
         "tune_operation=%s; enabled ops: split=%s merge=%s remove=%s revise=%s. "
         "remove: size<%s and L_z<%.4f. "
         "split: size>=%s, min_conditions=%s over [L_z<%.4f, C_z<%.4f, gap_median>=%.4f], cooldown=%s. "
-        "merge: min_conditions=%s over [cosine_sim>=%.2f, L_ratio<=%.3f, C_ratio<=%.3f]. "
+        "merge: require cosine_sim>=%.2f AND min_conditions=%s over [cosine_sim, L_ratio<=%.3f, C_ratio<=%.3f]. "
         "revise: min_conditions=%s over [L_z<%.4f, C_z<%.4f], cooldown=%s.",
         decision_baseline,
         baseline_log_px,
@@ -582,8 +589,8 @@ def decide_schema_updates(
         config.split_confidence_max,
         config.split_gap_median_min,
         config.split_cooldown_iters,
-        config.merge_min_conditions,
         config.merge_similarity_min,
+        config.merge_min_conditions,
         config.merge_l_diff_ratio_max,
         config.merge_c_diff_ratio_max,
         config.revise_min_conditions,
@@ -684,6 +691,9 @@ def decide_schema_updates(
                 diff_C = abs(m_i['C_z'] - m_j['C_z'])
                 diff_L_ratio = diff_L / max(abs(m_i['L_z']), abs(m_j['L_z']), 1e-8)
                 diff_C_ratio = diff_C / max(m_i['C_z'], m_j['C_z'], 1e-8)
+                # Structural guardrail: similarity must pass for any merge.
+                if sim_val < config.merge_similarity_min:
+                    continue
                 merge_conditions = [
                     sim_val >= config.merge_similarity_min,
                     diff_L_ratio <= config.merge_l_diff_ratio_max,
@@ -805,7 +815,7 @@ def _canonical_label_key(label: str) -> str:
     if label is None:
         return ""
     s = sanitize_text(label).lower()
-    # drop suffixes like __c123
+    # drop legacy synthetic suffixes if present
     if "__c" in s:
         s = s.split("__c")[0]
     # drop keywords after ":"
@@ -845,6 +855,125 @@ def _fallback_distinct_label_from_texts(
         if _canonical_label_key(candidate) not in banned_keys:
             return candidate
     return None
+
+
+def _collect_existing_cluster_labels(
+    df: pd.DataFrame,
+    *,
+    exclude_cluster_ids: set[int] | None = None,
+    cluster_col: str = "cluster_id",
+    label_col: str = "agglomerative_label",
+) -> list[str]:
+    if df.empty or cluster_col not in df.columns or label_col not in df.columns:
+        return []
+    exclude = {int(x) for x in (exclude_cluster_ids or set())}
+    labels: list[str] = []
+    grouped = df.groupby(cluster_col)[label_col].first().astype(str).to_dict()
+    for cid, lbl in grouped.items():
+        if int(cid) in exclude:
+            continue
+        labels.append(str(lbl))
+    return labels
+
+
+def _build_parent_relative_split_labels(
+    parent_label: str,
+    parent_id: int,
+) -> tuple[str, str]:
+    parent_base = base_label(parent_label) or "Cluster"
+    new_parent_label = build_label_string(f"{parent_base} Parent Z{int(parent_id)}")
+    new_child_label = build_label_string(f"{parent_base} Child Z{int(parent_id)}")
+    if _canonical_label_key(new_parent_label) == _canonical_label_key(new_child_label):
+        new_child_label = build_label_string(f"{parent_base} Child One Z{int(parent_id)}")
+    return new_parent_label, new_child_label
+
+
+def _build_parent_relative_merge_label(
+    source_labels: list[str],
+    root_id: int,
+) -> str:
+    if source_labels:
+        first = base_label(source_labels[0]) or "Cluster"
+        second = base_label(source_labels[1]) if len(source_labels) > 1 else ""
+        stem = f"{first} {second}".strip()
+    else:
+        stem = "Merged Cluster"
+    return build_label_string(f"{stem} Merged Z{int(root_id)}")
+
+
+def _propose_split_labels_with_retries(
+    *,
+    parent_samples: list[str],
+    child_samples: list[str],
+    parent_label: str,
+    model_identifier: str,
+    tokenizer,
+    model,
+    context_prefix: str,
+    existing_forbidden_names: list[str],
+    pair_attempts: int,
+    llm_label_max_attempts: int,
+) -> tuple[str | None, str | None]:
+    parent_base = base_label(parent_label) or "Cluster"
+    pair_attempts = max(1, int(pair_attempts))
+    banned_pool: list[str] = [n for n in existing_forbidden_names if sanitize_text(n)]
+    seen_parent_child_keys: set[str] = set()
+
+    for pair_try in range(1, pair_attempts + 1):
+        parent_llm = _label_cluster_vllm(
+            parent_samples,
+            model_identifier,
+            tokenizer=tokenizer,
+            model=model,
+            contrast_texts=child_samples,
+            parent_label=parent_base,
+            banned_names=banned_pool,
+            context=f"{context_prefix}:pair{pair_try}:parent",
+            max_attempts=llm_label_max_attempts,
+        )
+        new_parent_label = None
+        if parent_llm:
+            name, _, keywords = parent_llm
+            new_parent_label = build_label_string(name or parent_base, keywords)
+
+        child_banned = list(banned_pool)
+        child_banned.extend([new_parent_label, parent_base])
+        child_llm = _label_cluster_vllm(
+            child_samples,
+            model_identifier,
+            tokenizer=tokenizer,
+            model=model,
+            contrast_texts=parent_samples,
+            parent_label=parent_base,
+            banned_names=[x for x in child_banned if x],
+            context=f"{context_prefix}:pair{pair_try}:child",
+            max_attempts=llm_label_max_attempts,
+        )
+        new_child_label = None
+        if child_llm:
+            name, _, keywords = child_llm
+            new_child_label = build_label_string(name or "Split Child", keywords)
+
+        parent_key = _canonical_label_key(new_parent_label)
+        child_key = _canonical_label_key(new_child_label)
+        pair_key = f"{parent_key}::{child_key}"
+        if (
+            new_parent_label
+            and new_child_label
+            and parent_key
+            and child_key
+            and parent_key != child_key
+            and pair_key not in seen_parent_child_keys
+        ):
+            return new_parent_label, new_child_label
+
+        seen_parent_child_keys.add(pair_key)
+        if new_parent_label:
+            banned_pool.append(new_parent_label)
+        if new_child_label:
+            banned_pool.append(new_child_label)
+
+    return None, None
 
 
 def _label_cluster_vllm(
@@ -1022,15 +1151,29 @@ def _enforce_unique_choice_labels(
     cluster_ids = sorted(df[cluster_col].unique())
     cluster_labels = df.groupby(cluster_col)[label_col].first().astype(str).to_dict()
 
-    seen: set[str] = set()
+    seen_keys: set[str] = set()
+    base_variant_counters: dict[str, int] = {}
     new_map: dict[int, str] = {}
     changed = 0
     for cid in cluster_ids:
         canonical = build_label_string(cluster_labels.get(cid, f"cluster_{cid}"))
-        if canonical in seen:
-            canonical = build_label_string(f"{base_label(canonical)}__c{cid}")
+        canonical_key = _canonical_label_key(canonical)
+        if canonical_key in seen_keys:
+            base = base_label(canonical) or "Misc"
+            next_variant = max(2, base_variant_counters.get(base, 1) + 1)
+            while True:
+                candidate = build_label_string(f"{base} Variant {next_variant}")
+                candidate_key = _canonical_label_key(candidate)
+                if candidate_key not in seen_keys:
+                    canonical = candidate
+                    canonical_key = candidate_key
+                    base_variant_counters[base] = next_variant
+                    break
+                next_variant += 1
             changed += 1
-        seen.add(canonical)
+        seen_keys.add(canonical_key)
+        base = base_label(canonical) or "Misc"
+        base_variant_counters[base] = max(base_variant_counters.get(base, 1), 1)
         new_map[cid] = canonical
 
     if changed > 0:
@@ -1424,14 +1567,25 @@ def em_schema_refinement(
         raise ValueError(
             f"Invalid accept_metric '{config.accept_metric}'. Expected one of {VALID_ACCEPT_METRICS}."
         )
+    if config.structural_label_mode not in VALID_STRUCTURAL_LABEL_MODES:
+        raise ValueError(
+            f"Invalid structural_label_mode '{config.structural_label_mode}'. "
+            f"Expected one of {VALID_STRUCTURAL_LABEL_MODES}."
+        )
     logging.info(
-        "Operation config: tune_operation=%s | split=%s merge=%s remove=%s add=%s revise=%s",
+        "Operation config: tune_operation=%s | split=%s merge=%s remove=%s add=%s revise=%s | "
+        "best_operation_per_iteration=%s max_same_operation_streak=%s | structural_label_mode=%s split_label_pair_attempts=%s llm_label_max_attempts=%s",
         config.tune_operation,
         config.operation_enabled("split"),
         config.operation_enabled("merge"),
         config.operation_enabled("remove"),
         config.operation_enabled("add"),
         config.operation_enabled("revise"),
+        config.best_operation_per_iteration,
+        config.max_same_operation_streak,
+        config.structural_label_mode,
+        config.split_label_pair_attempts,
+        config.llm_label_max_attempts,
     )
     logging.info(f"Starting EM-style schema refinement for {max_iters} iterations...")
     logging.info(f"Computing initial sentence embeddings using {embedding_model_name}...")
@@ -1460,27 +1614,169 @@ def em_schema_refinement(
     elif token_count_tokenizer is None:
         logging.warning("No model tokenizer handle available for token counts. Falling back to whitespace token counts.")
 
-    def _compute_variant_metrics(df_for_metrics: pd.DataFrame, schema_for_metrics: SchemaState):
+    def _compute_variant_metrics(
+        df_for_metrics: pd.DataFrame,
+        schema_for_metrics: SchemaState,
+        *,
+        choices_override: list[str] | None = None,
+        calibrator_override: ProbabilityCalibrator | None = None,
+        tokenizer_override=None,
+    ):
+        choices_local = choices_override if choices_override is not None else current_choices_list
+        calibrator_local = calibrator_override if calibrator_override is not None else current_prob_calibrator
+        tokenizer_local = tokenizer_override if tokenizer_override is not None else token_count_tokenizer
         doc_scores_local = compute_document_level_scores(
             df=df_for_metrics,
             text_col=text_column_name,
             cluster_col="agglomerative_label",
-            choices=current_choices_list,
-            prob_calibrator=current_prob_calibrator,
+            choices=choices_local,
+            prob_calibrator=calibrator_local,
             embeddings=all_embeddings if 'all_embeddings' in locals() else None,
             p_z_prior=schema_for_metrics.p_z_prior,
         )
         token_counts_local = estimate_token_counts(
             df_for_metrics[text_column_name].astype(str).tolist(),
-            tokenizer=token_count_tokenizer,
+            tokenizer=tokenizer_local,
         )
         corpus_scores_local = compute_corpus_level_scores_variants(
             doc_scores=doc_scores_local,
             token_counts=token_counts_local,
-            k_complexity=len(current_choices_list),
+            k_complexity=len(choices_local),
             is_test_mask=None,
         )
         return doc_scores_local, token_counts_local, corpus_scores_local
+
+    def _reassign_removed_datapoints(
+        post_update_df: pd.DataFrame,
+        pre_update_df: pd.DataFrame,
+        removed_cluster_ids: list[int],
+        base_calibrator: ProbabilityCalibrator,
+        *,
+        iter_number: int | None = None,
+        log_details: bool = False,
+    ) -> pd.DataFrame:
+        """Reassign datapoints from removed clusters via argmax p(z|x) over remaining labels."""
+        if not removed_cluster_ids:
+            return post_update_df
+        removed_rows = pre_update_df[pre_update_df["cluster_id"].isin(removed_cluster_ids)].copy()
+        if removed_rows.empty:
+            return post_update_df
+        if post_update_df.empty:
+            logging.warning(
+                "Removed %s clusters but no remaining clusters to reassign %s datapoints; keeping current dataframe as-is.",
+                len(removed_cluster_ids),
+                len(removed_rows),
+            )
+            return post_update_df
+
+        remaining_cluster_ids = sorted(post_update_df["cluster_id"].unique())
+        remaining_label_map = (
+            post_update_df.groupby("cluster_id")["agglomerative_label"].first().astype(str).to_dict()
+        )
+        unique_label_map, reassignment_choices = build_unique_label_map(
+            remaining_cluster_ids,
+            remaining_label_map,
+            fallback_prefix="cluster",
+        )
+        choice_to_cluster_id = {
+            build_label_string(unique_label_map[cid]): cid
+            for cid in remaining_cluster_ids
+        }
+
+        reassignment_calibrator = base_calibrator
+        try:
+            if list(getattr(base_calibrator, "choices", [])) != list(reassignment_choices):
+                reassignment_calibrator = rebuild_calibrator_with_existing_backend(
+                    base_calibrator,
+                    reassignment_choices,
+                    verbose=False,
+                )
+        except Exception as exc:
+            logging.warning(
+                "Failed to rebuild calibrator for remove-reassignment choices; falling back to existing choices. Error: %s",
+                exc,
+            )
+
+        # Keep prior aligned to remaining cluster proportions during reassignment.
+        counts_by_cluster = post_update_df["cluster_id"].value_counts().to_dict()
+        reassignment_prior = np.array(
+            [counts_by_cluster.get(cid, 0) for cid in remaining_cluster_ids],
+            dtype=float,
+        )
+        if reassignment_prior.sum() > 0:
+            reassignment_prior = reassignment_prior / reassignment_prior.sum()
+            try:
+                reassignment_calibrator.p_z = reassignment_prior
+            except Exception:
+                pass
+
+        reassigned_rows = removed_rows.copy()
+        reassignment_events: list[dict] = []
+        for row_idx, row in reassigned_rows.iterrows():
+            old_cluster_id = int(row["cluster_id"])
+            sentence_text = str(row[text_column_name])
+            pzx = np.asarray(reassignment_calibrator.calibrate_p_z_given_X(sentence_text), dtype=float)
+            if pzx.size == 0:
+                target_cid = remaining_cluster_ids[0]
+            else:
+                best_choice = reassignment_choices[int(np.argmax(pzx))]
+                target_cid = choice_to_cluster_id.get(best_choice, remaining_cluster_ids[0])
+            reassigned_rows.at[row_idx, "cluster_id"] = target_cid
+            reassigned_rows.at[row_idx, "agglomerative_label"] = remaining_label_map.get(
+                target_cid,
+                f"cluster_{target_cid}",
+            )
+            reassignment_events.append(
+                {
+                    "row_index": row_idx,
+                    "old_cluster_id": old_cluster_id,
+                    "new_cluster_id": int(target_cid),
+                    "new_cluster_label": remaining_label_map.get(target_cid, f"cluster_{target_cid}"),
+                    "sentence_preview": sentence_text[:200],
+                }
+            )
+
+        combined = pd.concat([post_update_df, reassigned_rows], axis=0, sort=False)
+        combined = combined.sort_index()
+        logging.info(
+            "Reassigned %s datapoints from removed clusters %s to remaining clusters.",
+            len(reassigned_rows),
+            sorted(set(int(x) for x in removed_cluster_ids)),
+        )
+        if reassignment_events:
+            events_df = pd.DataFrame(reassignment_events)
+            transition_counts = (
+                events_df.groupby(["old_cluster_id", "new_cluster_id", "new_cluster_label"], dropna=False)
+                .size()
+                .reset_index(name="count")
+                .sort_values(["old_cluster_id", "count", "new_cluster_id"], ascending=[True, False, True])
+            )
+            for rec in transition_counts.to_dict(orient="records"):
+                logging.info(
+                    "  Remove reassignment: old_cluster=%s -> new_cluster=%s ('%s') count=%s",
+                    rec["old_cluster_id"],
+                    rec["new_cluster_id"],
+                    rec["new_cluster_label"],
+                    rec["count"],
+                )
+            if log_details:
+                for rec in events_df.to_dict(orient="records"):
+                    logging.info(
+                        "  Remove reassignment detail: row=%s old_cluster=%s -> new_cluster=%s ('%s') text='%s'",
+                        rec["row_index"],
+                        rec["old_cluster_id"],
+                        rec["new_cluster_id"],
+                        rec["new_cluster_label"],
+                        rec["sentence_preview"],
+                    )
+            if diagnostics_dir is not None and iter_number is not None:
+                try:
+                    out_path = diagnostics_dir / f"remove_reassignment_iter_{int(iter_number):02d}.csv"
+                    events_df.to_csv(out_path, index=False)
+                    logging.info("Saved remove reassignment details to: %s", out_path)
+                except Exception as exc:
+                    logging.warning("Failed to save remove reassignment details CSV: %s", exc)
+        return combined
 
     schema_history = []
     if current_merged_df['cluster_id'].empty:
@@ -1528,7 +1824,599 @@ def em_schema_refinement(
     revise_cooldown: dict[int, int] = {}
     add_cooldown_until = 0
     no_op_iters = 0
+    last_selected_operation: str | None = None
+    same_operation_streak = 0
     iteration_metrics_rows: list[dict] = []
+    if config.best_operation_per_iteration and config.tune_operation != "all":
+        logging.warning(
+            "best_operation_per_iteration is enabled but tune_operation=%s (not 'all'); best-op mode will be ignored.",
+            config.tune_operation,
+        )
+
+    def _simulate_operation_delta(
+        op_name: str,
+        op_actions: dict,
+        pre_df: pd.DataFrame,
+        pre_schema_state: SchemaState,
+        pre_choices: list[str],
+        pre_prob_calibrator: ProbabilityCalibrator,
+        pre_next_new_cluster_id: int,
+        baseline_accept_metric_value: float,
+    ) -> float | None:
+        """
+        Fast structural simulation to score a single candidate operation from the same pre-iteration state.
+        This deliberately skips expensive relabeling/add-step and scores post-schema assignment quality directly.
+        """
+        if op_name not in {"split", "merge", "remove", "revise"}:
+            return None
+        if not op_actions.get(op_name):
+            return None
+        try:
+            sim_df, _, _, _ = apply_schema_updates(
+                pre_df.copy(),
+                all_embeddings,
+                idx_to_emb_pos_map,
+                op_actions,
+                pre_next_new_cluster_id,
+            )
+            if op_actions.get("remove"):
+                sim_df = _reassign_removed_datapoints(
+                    post_update_df=sim_df,
+                    pre_update_df=pre_df,
+                    removed_cluster_ids=list(op_actions.get("remove", [])),
+                    base_calibrator=pre_prob_calibrator,
+                )
+            if sim_df.empty:
+                return None
+            _rename_duplicate_labels(sim_df, text_column_name)
+            _enforce_unique_choice_labels(sim_df)
+            sim_schema = build_schema_state_from_df(sim_df)
+            sim_df["agglomerative_label"] = sim_df["cluster_id"].map(sim_schema.label_map)
+            sim_choices = list(sim_schema.choices_list)
+            sim_calibrator = pre_prob_calibrator
+            if list(pre_choices) != list(sim_choices):
+                sim_calibrator = rebuild_calibrator_with_existing_backend(
+                    pre_prob_calibrator,
+                    sim_choices,
+                    verbose=False,
+                )
+            if sim_schema.p_z_prior is not None:
+                sim_calibrator.p_z = sim_schema.p_z_prior
+            sim_doc_scores = compute_document_level_scores(
+                df=sim_df,
+                text_col=text_column_name,
+                cluster_col="agglomerative_label",
+                choices=sim_choices,
+                prob_calibrator=sim_calibrator,
+                embeddings=all_embeddings if 'all_embeddings' in locals() else None,
+                p_z_prior=sim_schema.p_z_prior,
+            )
+            sim_token_counts = estimate_token_counts(
+                sim_df[text_column_name].astype(str).tolist(),
+                tokenizer=token_count_tokenizer,
+            )
+            sim_corpus_scores = compute_corpus_level_scores_variants(
+                doc_scores=sim_doc_scores,
+                token_counts=sim_token_counts,
+                k_complexity=len(sim_choices),
+                is_test_mask=None,
+            )
+            accept_metric_key = f"avg_logL_per_token_{config.accept_metric}"
+            return float(sim_corpus_scores[accept_metric_key] - baseline_accept_metric_value)
+        except Exception as exc:
+            logging.warning(
+                "[Iter %s] Candidate simulation failed for op '%s': %s",
+                iter_idx + 1 if 'iter_idx' in locals() else -1,
+                op_name,
+                exc,
+            )
+            return None
+
+    def _execute_candidate_full_pipeline(
+        *,
+        candidate_op_name: str,
+        candidate_actions: dict,
+        iter_number: int,
+        pre_df: pd.DataFrame,
+        pre_schema_state: SchemaState,
+        pre_choices: list[str],
+        pre_prob_calibrator: ProbabilityCalibrator,
+        pre_tokenizer,
+        pre_next_new_cluster_id: int,
+        pre_split_cooldown: dict[int, int],
+        pre_revise_cooldown: dict[int, int],
+        pre_add_cooldown_until: int,
+        baseline_accept_metric_value: float,
+        pre_corpus_scores: dict | None,
+    ) -> dict | None:
+        """
+        Execute a full candidate op path on a copied state and return its actual post-score delta.
+        This mirrors the real execution path (apply/relabel/add/schema rebuild/re-score).
+        """
+        try:
+            cand_df = pre_df.copy()
+            cand_schema_state = pre_schema_state
+            cand_choices = list(pre_choices)
+            cand_next_new_cluster_id = int(pre_next_new_cluster_id)
+            cand_split_cooldown = dict(pre_split_cooldown)
+            cand_revise_cooldown = dict(pre_revise_cooldown)
+            cand_add_cooldown_until = int(pre_add_cooldown_until)
+            cand_tokenizer = pre_tokenizer
+
+            try:
+                cand_prob_calibrator = rebuild_calibrator_with_existing_backend(
+                    pre_prob_calibrator,
+                    cand_choices,
+                    verbose=False,
+                )
+            except Exception:
+                cand_prob_calibrator = pre_prob_calibrator
+
+            cand_iteration_actions = {
+                "split": list(candidate_actions.get("split", [])),
+                "merge": list(candidate_actions.get("merge", [])),
+                "remove": list(candidate_actions.get("remove", [])),
+                "revise": list(candidate_actions.get("revise", [])),
+                "selected_operation": candidate_op_name,
+            }
+
+            cand_df, cand_next_new_cluster_id, split_pairs, merge_groups = apply_schema_updates(
+                cand_df,
+                all_embeddings,
+                idx_to_emb_pos_map,
+                {
+                    "split": list(cand_iteration_actions.get("split", [])),
+                    "merge": list(cand_iteration_actions.get("merge", [])),
+                    "remove": list(cand_iteration_actions.get("remove", [])),
+                    "revise": list(cand_iteration_actions.get("revise", [])),
+                },
+                cand_next_new_cluster_id,
+            )
+
+            if cand_iteration_actions.get("remove"):
+                cand_df = _reassign_removed_datapoints(
+                    post_update_df=cand_df,
+                    pre_update_df=pre_df,
+                    removed_cluster_ids=list(cand_iteration_actions.get("remove", [])),
+                    base_calibrator=cand_prob_calibrator,
+                    iter_number=None,
+                    log_details=False,
+                )
+
+            split_child_ids = {child for _, child in split_pairs}
+            if split_pairs and config.operation_enabled("split"):
+                shared_vllm_tokenizer = getattr(cand_prob_calibrator, "vllm_tokenizer", None)
+                shared_vllm_model = getattr(cand_prob_calibrator, "vllm_model", None)
+                kept_split_pairs: list[tuple[int, int]] = []
+                for parent_id, child_id in split_pairs:
+                    parent_label = pre_schema_state.label_map.get(parent_id, f"cluster_{parent_id}")
+                    parent_texts = cand_df.loc[cand_df["cluster_id"] == parent_id, text_column_name].astype(str).tolist()
+                    child_texts = cand_df.loc[cand_df["cluster_id"] == child_id, text_column_name].astype(str).tolist()
+                    parent_samples = _sample_texts_for_labeling(parent_texts, max_texts=10, seed=int(parent_id))
+                    child_samples = _sample_texts_for_labeling(child_texts, max_texts=10, seed=int(child_id))
+                    existing_forbidden_names = _collect_existing_cluster_labels(
+                        cand_df,
+                        exclude_cluster_ids={int(parent_id), int(child_id)},
+                    )
+
+                    if config.structural_label_mode == "parent_relative":
+                        new_parent_label, new_child_label = _build_parent_relative_split_labels(
+                            parent_label=parent_label,
+                            parent_id=int(parent_id),
+                        )
+                    elif model_type == "vllm":
+                        new_parent_label, new_child_label = _propose_split_labels_with_retries(
+                            parent_samples=parent_samples,
+                            child_samples=child_samples,
+                            parent_label=parent_label,
+                            model_identifier=model_identifier,
+                            tokenizer=shared_vllm_tokenizer,
+                            model=shared_vllm_model,
+                            context_prefix=f"candidate:{candidate_op_name}:split:{parent_id}->{child_id}",
+                            existing_forbidden_names=existing_forbidden_names,
+                            pair_attempts=config.split_label_pair_attempts,
+                            llm_label_max_attempts=config.llm_label_max_attempts,
+                        )
+                    else:
+                        new_parent_label, new_child_label = _build_parent_relative_split_labels(
+                            parent_label=parent_label,
+                            parent_id=int(parent_id),
+                        )
+
+                    parent_key = _canonical_label_key(new_parent_label)
+                    child_key = _canonical_label_key(new_child_label)
+                    pair_near_dupe = False
+                    if parent_key and child_key:
+                        pair_near_dupe = bool(
+                            detect_near_duplicate_labels(
+                                [new_parent_label, new_child_label],
+                                threshold=DUP_LABEL_SIM_THRESHOLD,
+                            )
+                        )
+                    existing_label_keys = {
+                        _canonical_label_key(lbl)
+                        for cid, lbl in cand_df.groupby("cluster_id")["agglomerative_label"].first().items()
+                        if int(cid) not in {int(parent_id), int(child_id)}
+                    }
+                    collides_existing_label = bool(
+                        (parent_key and parent_key in existing_label_keys)
+                        or (child_key and child_key in existing_label_keys)
+                    )
+
+                    if (
+                        not new_parent_label
+                        or not new_child_label
+                        or not parent_key
+                        or not child_key
+                        or parent_key == child_key
+                        or pair_near_dupe
+                        or collides_existing_label
+                    ):
+                        logging.warning(
+                            "[Iter %s] [Candidate %s] Reverting split (%s -> %s): invalid/distinct labels failed "
+                            "(parent='%s', child='%s', collides_existing=%s).",
+                            iter_number,
+                            candidate_op_name,
+                            parent_id,
+                            child_id,
+                            new_parent_label,
+                            new_child_label,
+                            collides_existing_label,
+                        )
+                        cand_df.loc[cand_df["cluster_id"] == child_id, "cluster_id"] = parent_id
+                        cand_df.loc[cand_df["cluster_id"] == parent_id, "agglomerative_label"] = parent_label
+                        continue
+
+                    cand_df.loc[cand_df["cluster_id"] == parent_id, "agglomerative_label"] = new_parent_label
+                    cand_df.loc[cand_df["cluster_id"] == child_id, "agglomerative_label"] = new_child_label
+                    kept_split_pairs.append((parent_id, child_id))
+                split_pairs = kept_split_pairs
+                split_child_ids = {child for _, child in split_pairs}
+                cand_iteration_actions["split"] = [p for p, _ in split_pairs]
+
+            if merge_groups and config.operation_enabled("merge"):
+                shared_vllm_tokenizer = getattr(cand_prob_calibrator, "vllm_tokenizer", None)
+                shared_vllm_model = getattr(cand_prob_calibrator, "vllm_model", None)
+                for root_id, member_ids in merge_groups:
+                    if root_id not in set(cand_df["cluster_id"].unique()):
+                        continue
+                    source_labels = [
+                        pre_schema_state.label_map.get(mid, f"cluster_{mid}")
+                        for mid in member_ids
+                    ]
+                    merged_texts = cand_df.loc[
+                        cand_df["cluster_id"] == root_id, text_column_name
+                    ].astype(str).tolist()
+                    merged_samples = _sample_texts_for_labeling(merged_texts, max_texts=12, seed=int(root_id))
+                    new_merge_label = None
+                    existing_forbidden_names = _collect_existing_cluster_labels(
+                        cand_df,
+                        exclude_cluster_ids={int(root_id)},
+                    )
+                    merge_banned_names = list(existing_forbidden_names) + list(source_labels)
+                    if config.structural_label_mode == "parent_relative":
+                        new_merge_label = _build_parent_relative_merge_label(
+                            source_labels=[str(x) for x in source_labels],
+                            root_id=int(root_id),
+                        )
+                    elif model_type == "vllm":
+                        llm_label = _label_cluster_vllm(
+                            merged_samples,
+                            model_identifier,
+                            tokenizer=shared_vllm_tokenizer,
+                            model=shared_vllm_model,
+                            parent_label=" + ".join(base_label(lbl) for lbl in source_labels[:2]),
+                            banned_names=merge_banned_names,
+                            context=f"candidate:{candidate_op_name}:merge_cluster:{root_id}",
+                            max_attempts=config.llm_label_max_attempts,
+                        )
+                        if llm_label:
+                            name, _, keywords = llm_label
+                            new_merge_label = build_label_string(name, keywords)
+                    if not new_merge_label:
+                        new_merge_label = _fallback_distinct_label_from_texts(
+                            merged_samples,
+                            banned_names=merge_banned_names,
+                        )
+                        if not new_merge_label:
+                            name, keywords = propose_label_and_keywords_from_texts(merged_samples, parent_label=None)
+                            new_merge_label = build_label_string(name, keywords)
+                    cand_df.loc[cand_df["cluster_id"] == root_id, "agglomerative_label"] = new_merge_label
+
+            revised_clusters_applied: list[int] = []
+            if cand_iteration_actions.get("revise") and config.operation_enabled("revise"):
+                shared_vllm_tokenizer = getattr(cand_prob_calibrator, "vllm_tokenizer", None)
+                shared_vllm_model = getattr(cand_prob_calibrator, "vllm_model", None)
+                current_cluster_ids = set(cand_df["cluster_id"].unique())
+                for cid in cand_iteration_actions["revise"]:
+                    if cid not in current_cluster_ids:
+                        continue
+                    current_label = str(cand_df.loc[cand_df["cluster_id"] == cid, "agglomerative_label"].iloc[0])
+                    revise_texts = cand_df.loc[cand_df["cluster_id"] == cid, text_column_name].astype(str).tolist()
+                    revise_samples = _sample_texts_for_labeling(revise_texts, max_texts=12, seed=int(cid))
+                    new_label = None
+                    if model_type == "vllm":
+                        llm_label = _label_cluster_vllm(
+                            revise_samples,
+                            model_identifier,
+                            tokenizer=shared_vllm_tokenizer,
+                            model=shared_vllm_model,
+                            parent_label=base_label(current_label),
+                            banned_names=[current_label],
+                            context=f"candidate:{candidate_op_name}:revise_cluster:{cid}",
+                            max_attempts=config.llm_label_max_attempts,
+                        )
+                        if llm_label:
+                            name, _, keywords = llm_label
+                            new_label = build_label_string(name, keywords)
+                    if not new_label:
+                        new_label = _fallback_distinct_label_from_texts(revise_samples, banned_names=[current_label])
+                        if not new_label:
+                            name, keywords = propose_label_and_keywords_from_texts(
+                                revise_samples,
+                                parent_label=base_label(current_label),
+                            )
+                            new_label = build_label_string(name, keywords)
+                    cand_df.loc[cand_df["cluster_id"] == cid, "agglomerative_label"] = new_label
+                    revised_clusters_applied.append(int(cid))
+                cand_iteration_actions["revise"] = revised_clusters_applied
+                for cid in revised_clusters_applied:
+                    cand_revise_cooldown[cid] = iter_number + config.revise_cooldown_iters
+
+            dup_renamed = _rename_duplicate_labels(cand_df, text_column_name)
+
+            duplicates_prevented = False
+            if split_pairs:
+                still_kept_pairs: list[tuple[int, int]] = []
+                for parent_id, child_id in split_pairs:
+                    if child_id not in set(cand_df["cluster_id"].unique()):
+                        continue
+                    parent_label_now = str(cand_df.loc[cand_df["cluster_id"] == parent_id, "agglomerative_label"].iloc[0])
+                    child_label_now = str(cand_df.loc[cand_df["cluster_id"] == child_id, "agglomerative_label"].iloc[0])
+                    pair_dup = bool(
+                        detect_near_duplicate_labels(
+                            [parent_label_now, child_label_now],
+                            threshold=DUP_LABEL_SIM_THRESHOLD,
+                        )
+                    )
+                    if pair_dup or _canonical_label_key(parent_label_now) == _canonical_label_key(child_label_now):
+                        duplicates_prevented = True
+                        cand_df.loc[cand_df["cluster_id"] == child_id, "cluster_id"] = parent_id
+                    else:
+                        still_kept_pairs.append((parent_id, child_id))
+                split_pairs = still_kept_pairs
+                split_child_ids = {child for _, child in split_pairs}
+                cand_iteration_actions["split"] = [p for p, _ in split_pairs]
+                cand_df["agglomerative_label"] = cand_df["cluster_id"].map(
+                    cand_df.groupby("cluster_id")["agglomerative_label"].first().to_dict()
+                )
+            if split_pairs:
+                for parent_id, _ in split_pairs:
+                    cand_split_cooldown[parent_id] = iter_number + config.split_cooldown_iters
+
+            add_prev_cluster_ids = None
+            schema_unstable = bool(
+                cand_iteration_actions.get("split")
+                or cand_iteration_actions.get("merge")
+                or cand_iteration_actions.get("remove")
+                or duplicates_prevented
+            )
+            added_clusters_info = []
+            if not config.operation_enabled("add"):
+                pass
+            elif iter_number <= cand_add_cooldown_until:
+                pass
+            else:
+                poor_indices = []
+                pmax_vals = []
+                entropy_vals = []
+                assigned_ranks = []
+                all_indices = []
+                for original_idx in cand_df.index:
+                    sentence_text = cand_df.loc[original_idx, text_column_name]
+                    probabilities = cand_prob_calibrator.calibrate_p_z_given_X(sentence_text)
+                    pmax = float(np.max(probabilities)) if hasattr(probabilities, "__len__") and len(probabilities) > 0 else 0.0
+                    pmax_vals.append(pmax)
+                    all_indices.append(original_idx)
+
+                    diag = compute_posterior_diagnostics(
+                        pzx=np.asarray(probabilities, dtype=float),
+                        choices_list=cand_choices,
+                        p_z_prior=(
+                            cand_schema_state.p_z_prior
+                            if cand_schema_state.p_z_prior is not None
+                            else np.ones(len(cand_choices)) / max(1, len(cand_choices))
+                        ),
+                        assigned_label=cand_df.loc[original_idx, "agglomerative_label"],
+                    )
+                    entropy_vals.append(diag["entropy"])
+                    assigned_ranks.append(diag["assigned_rank"])
+
+                poor_pos, _ = _select_poor_candidates(
+                    pmax_vals,
+                    entropy_vals,
+                    assigned_ranks,
+                    config.add_min_poorly_explained,
+                    config.add_low_confidence_max,
+                    config.add_low_confidence_quantile,
+                    config.add_entropy_min,
+                )
+                poor_indices = [all_indices[i] for i in poor_pos]
+
+                if len(cand_choices) >= config.add_max_total_clusters:
+                    poor_indices = []
+
+                if len(poor_indices) >= config.add_min_poorly_explained:
+                    valid_poor_indices = []
+                    poor_emb_positions = []
+                    for idx in poor_indices:
+                        if idx in idx_to_emb_pos_map:
+                            valid_poor_indices.append(idx)
+                            poor_emb_positions.append(idx_to_emb_pos_map[idx])
+
+                    if poor_emb_positions:
+                        prev_cluster_ids = cand_df.loc[valid_poor_indices, "cluster_id"].copy()
+                        add_prev_cluster_ids = prev_cluster_ids
+                        emb_poor = all_embeddings[poor_emb_positions]
+                        num_new_clusters_to_add = max(1, len(valid_poor_indices) // config.add_items_per_new_cluster)
+                        num_new_clusters_to_add = min(num_new_clusters_to_add, config.add_max_new_clusters_per_iter)
+                        from sklearn.cluster import KMeans
+                        if len(emb_poor) < num_new_clusters_to_add:
+                            num_new_clusters_to_add = len(emb_poor)
+                        try:
+                            from sklearn.metrics.pairwise import cosine_similarity
+
+                            created = 0
+                            for k_try in [min(2, num_new_clusters_to_add), min(3, num_new_clusters_to_add)]:
+                                if k_try < 2:
+                                    continue
+                                kmeans_poor = KMeans(n_clusters=k_try, n_init='auto', random_state=42)
+                                new_labels_for_poor_texts = kmeans_poor.fit_predict(emb_poor)
+                                for k_new_cluster in range(k_try):
+                                    new_cluster_original_indices = [
+                                        valid_poor_indices[i]
+                                        for i, lab in enumerate(new_labels_for_poor_texts)
+                                        if lab == k_new_cluster
+                                    ]
+                                    if len(new_cluster_original_indices) < config.add_min_group_size:
+                                        continue
+                                    E = all_embeddings[[idx_to_emb_pos_map[i] for i in new_cluster_original_indices]]
+                                    centroid = E.mean(axis=0, keepdims=True)
+                                    sims = cosine_similarity(E, centroid).flatten()
+                                    if float(np.mean(sims)) < config.add_cohesion_min:
+                                        continue
+                                    assigned_new_id = cand_next_new_cluster_id
+                                    cand_next_new_cluster_id += 1
+                                    cand_df.loc[new_cluster_original_indices, "cluster_id"] = assigned_new_id
+                                    texts = cand_df.loc[new_cluster_original_indices, text_column_name].astype(str).tolist()
+                                    new_label = None
+                                    if model_type == "vllm":
+                                        llm_label = _label_cluster_vllm(
+                                            texts,
+                                            model_identifier,
+                                            tokenizer=getattr(cand_prob_calibrator, "vllm_tokenizer", None),
+                                            model=getattr(cand_prob_calibrator, "vllm_model", None),
+                                            context=f"candidate:{candidate_op_name}:add_cluster:{assigned_new_id}",
+                                            max_attempts=config.llm_label_max_attempts,
+                                        )
+                                        if llm_label:
+                                            name, _, keywords = llm_label
+                                            new_label = build_label_string(name, keywords)
+                                    if not new_label:
+                                        name, keywords = propose_label_and_keywords_from_texts(texts, parent_label=None)
+                                        new_label = build_label_string(name, keywords)
+                                    cand_df.loc[new_cluster_original_indices, "agglomerative_label"] = new_label
+                                    added_clusters_info.append({"id": assigned_new_id, "size": len(new_cluster_original_indices)})
+                                    created += 1
+                                    if created >= config.add_max_new_clusters_per_iter:
+                                        break
+                                if created > 0:
+                                    break
+                            if created == 0:
+                                cand_df.loc[valid_poor_indices, "cluster_id"] = prev_cluster_ids.values
+                                added_clusters_info = []
+                        except Exception:
+                            pass
+
+            if added_clusters_info:
+                labels_now = cand_df.groupby("cluster_id")["agglomerative_label"].first().astype(str).tolist()
+                dup_pairs = detect_near_duplicate_labels(labels_now, threshold=DUP_LABEL_SIM_THRESHOLD)
+                if dup_pairs:
+                    if add_prev_cluster_ids is not None:
+                        cand_df.loc[add_prev_cluster_ids.index, "cluster_id"] = add_prev_cluster_ids.values
+                    added_clusters_info = []
+                else:
+                    cand_add_cooldown_until = iter_number + config.add_cooldown_iters
+
+            cand_iteration_actions["add"] = added_clusters_info
+
+            dup_renamed += _rename_duplicate_labels(cand_df, text_column_name)
+            forced_unique = _enforce_unique_choice_labels(cand_df)
+            if forced_unique > 0:
+                logging.info(
+                    "[Iter %s] [Candidate %s] enforced unique schema labels for %s clusters.",
+                    iter_number,
+                    candidate_op_name,
+                    forced_unique,
+                )
+
+            cand_schema_state = build_schema_state_from_df(cand_df)
+            cand_df["agglomerative_label"] = cand_df["cluster_id"].map(cand_schema_state.label_map)
+            cand_choices = list(cand_schema_state.choices_list)
+            if list(cand_prob_calibrator.choices) != list(cand_choices):
+                try:
+                    cand_prob_calibrator = rebuild_calibrator_with_existing_backend(
+                        cand_prob_calibrator,
+                        cand_choices,
+                        verbose=False,
+                    )
+                except Exception:
+                    cand_prob_calibrator = initialize_probability_calibrator(
+                        model_identifier=model_identifier,
+                        model_type=model_type,
+                        choices=cand_choices,
+                        num_trials=cand_prob_calibrator.num_trials,
+                        scorer_type="batch" if cand_prob_calibrator.batch_prompts is False else "single",
+                        verbose=False,
+                    )
+
+            cand_tokenizer = (
+                getattr(cand_prob_calibrator, "tokenizer", None)
+                or getattr(cand_prob_calibrator, "vllm_tokenizer", None)
+                or cand_tokenizer
+            )
+            if cand_schema_state.p_z_prior is not None:
+                cand_prob_calibrator.p_z = cand_schema_state.p_z_prior
+
+            post_doc_scores, _, post_corpus_scores = _compute_variant_metrics(
+                cand_df,
+                cand_schema_state,
+                choices_override=cand_choices,
+                calibrator_override=cand_prob_calibrator,
+                tokenizer_override=cand_tokenizer,
+            )
+            accept_metric_key = f"avg_logL_per_token_{config.accept_metric}"
+            metric_delta = float(post_corpus_scores[accept_metric_key] - baseline_accept_metric_value)
+            prepost_delta = (
+                float(post_corpus_scores[accept_metric_key] - pre_corpus_scores[accept_metric_key])
+                if pre_corpus_scores is not None
+                else np.nan
+            )
+            proposed_action_count = int(
+                len(cand_iteration_actions.get("split", []))
+                + len(cand_iteration_actions.get("merge", []))
+                + len(cand_iteration_actions.get("remove", []))
+                + len(cand_iteration_actions.get("add", []))
+                + len(cand_iteration_actions.get("revise", []))
+            )
+
+            return {
+                "candidate_op_name": candidate_op_name,
+                "iteration_actions": cand_iteration_actions,
+                "merged_df": cand_df,
+                "schema_state": cand_schema_state,
+                "choices_list": cand_choices,
+                "prob_calibrator": cand_prob_calibrator,
+                "tokenizer": cand_tokenizer,
+                "next_new_cluster_id": cand_next_new_cluster_id,
+                "split_cooldown": cand_split_cooldown,
+                "revise_cooldown": cand_revise_cooldown,
+                "add_cooldown_until": cand_add_cooldown_until,
+                "post_doc_scores": post_doc_scores,
+                "post_corpus_scores": post_corpus_scores,
+                "metric_delta": metric_delta,
+                "prepost_delta": prepost_delta,
+                "proposed_action_count": proposed_action_count,
+                "cluster_count": int(cand_df["cluster_id"].nunique()),
+            }
+        except Exception as exc:
+            logging.warning(
+                "[Iter %s] Candidate op '%s' full execution failed: %s",
+                iter_number,
+                candidate_op_name,
+                exc,
+            )
+            return None
     for iter_idx in range(max_iters):
         logging.info(f"=== EM Iteration {iter_idx + 1}/{max_iters} ===")
         iteration_actions = {}
@@ -1608,7 +2496,315 @@ def em_schema_refinement(
             verbose=verbose,
             log_top_pairs=log_top_pairs,
         )
+        selected_operation_for_iter = None
+        if config.best_operation_per_iteration and config.tune_operation == "all":
+            baseline_accept_metric_value = float(
+                accepted_avg_logL_per_token_by_variant.get(config.accept_metric)
+                if accepted_avg_logL_per_token_by_variant.get(config.accept_metric) is not None
+                else pre_corpus_scores_iter[f"avg_logL_per_token_{config.accept_metric}"]
+            )
+            logging.info(
+                "[Iter %s] Threshold-passing structural actions: split=%s merge=%s remove=%s",
+                iter_idx + 1,
+                len(actions.get("split", [])),
+                len(actions.get("merge", [])),
+                len(actions.get("remove", [])),
+            )
+
+            candidate_specs: list[tuple[str, dict]] = []
+            for op_name in ("merge", "split", "remove"):
+                op_payload = actions.get(op_name, [])
+                if not op_payload:
+                    logging.info("[Iter %s] Candidate op '%s' not created: no threshold-passing actions.", iter_idx + 1, op_name)
+                    continue
+                if (
+                    config.max_same_operation_streak > 0
+                    and last_selected_operation == op_name
+                    and same_operation_streak >= int(config.max_same_operation_streak)
+                ):
+                    logging.info(
+                        "[Iter %s] Candidate op '%s' skipped by max_same_operation_streak=%s (current streak=%s).",
+                        iter_idx + 1,
+                        op_name,
+                        config.max_same_operation_streak,
+                        same_operation_streak,
+                    )
+                    continue
+                op_actions = {"split": [], "merge": [], "remove": [], "revise": []}
+                op_actions[op_name] = list(op_payload)
+                candidate_specs.append((op_name, op_actions))
+
+            if config.operation_enabled("add"):
+                candidate_specs.append(("add", {"split": [], "merge": [], "remove": [], "revise": []}))
+            else:
+                logging.info("[Iter %s] Candidate op 'add' not created: add disabled.", iter_idx + 1)
+
+            candidate_results: list[dict] = []
+            for op_name, op_actions in candidate_specs:
+                logging.info(
+                    "[Iter %s] Evaluating candidate op '%s' with actions=%s (full execution on copied state).",
+                    iter_idx + 1,
+                    op_name,
+                    op_actions,
+                )
+                result = _execute_candidate_full_pipeline(
+                    candidate_op_name=op_name,
+                    candidate_actions=op_actions,
+                    iter_number=iter_idx + 1,
+                    pre_df=prev_merged_df,
+                    pre_schema_state=prev_schema_state,
+                    pre_choices=prev_choices_list,
+                    pre_prob_calibrator=prev_prob_calibrator,
+                    pre_tokenizer=prev_token_count_tokenizer,
+                    pre_next_new_cluster_id=prev_next_new_cluster_id,
+                    pre_split_cooldown=prev_split_cooldown,
+                    pre_revise_cooldown=prev_revise_cooldown,
+                    pre_add_cooldown_until=prev_add_cooldown_until,
+                    baseline_accept_metric_value=baseline_accept_metric_value,
+                    pre_corpus_scores=pre_corpus_scores_iter,
+                )
+                if result is None:
+                    logging.info("[Iter %s] Candidate op '%s' failed during full execution.", iter_idx + 1, op_name)
+                    continue
+                candidate_results.append(result)
+                logging.info(
+                    "[Iter %s] Candidate op '%s' result: proposed_actions=%s clusters=%s delta_vs_best_%s=%.6f delta_post_pre_%s=%.6f",
+                    iter_idx + 1,
+                    op_name,
+                    {
+                        "split": len(result["iteration_actions"].get("split", [])),
+                        "merge": len(result["iteration_actions"].get("merge", [])),
+                        "remove": len(result["iteration_actions"].get("remove", [])),
+                        "add": len(result["iteration_actions"].get("add", [])),
+                        "revise": len(result["iteration_actions"].get("revise", [])),
+                    },
+                    result["cluster_count"],
+                    config.accept_metric,
+                    float(result["metric_delta"]),
+                    config.accept_metric,
+                    float(result["prepost_delta"]),
+                )
+
+            improving_candidates = [
+                r for r in candidate_results
+                if int(r.get("proposed_action_count", 0)) > 0
+                and float(r.get("metric_delta", -np.inf)) >= float(config.accept_min_delta)
+            ]
+            chosen_candidate = None
+            if improving_candidates:
+                chosen_candidate = max(improving_candidates, key=lambda r: float(r["metric_delta"]))
+                selected_operation_for_iter = str(chosen_candidate["candidate_op_name"])
+                logging.info(
+                    "[Iter %s] Selected candidate op '%s' with best ACTUAL delta_vs_best_%s=%.6f.",
+                    iter_idx + 1,
+                    selected_operation_for_iter,
+                    config.accept_metric,
+                    float(chosen_candidate["metric_delta"]),
+                )
+
+                current_merged_df = chosen_candidate["merged_df"]
+                schema_state = chosen_candidate["schema_state"]
+                current_choices_list = list(chosen_candidate["choices_list"])
+                current_prob_calibrator = chosen_candidate["prob_calibrator"]
+                token_count_tokenizer = chosen_candidate["tokenizer"]
+                next_new_cluster_id = int(chosen_candidate["next_new_cluster_id"])
+                split_cooldown = dict(chosen_candidate["split_cooldown"])
+                revise_cooldown = dict(chosen_candidate["revise_cooldown"])
+                add_cooldown_until = int(chosen_candidate["add_cooldown_until"])
+
+                iteration_actions = dict(chosen_candidate["iteration_actions"])
+                iteration_actions["selected_operation"] = selected_operation_for_iter
+                metric_delta = float(chosen_candidate["metric_delta"])
+                post_doc_scores_iter = chosen_candidate["post_doc_scores"]
+                post_corpus_scores_iter = chosen_candidate["post_corpus_scores"]
+                proposed_action_count = int(chosen_candidate["proposed_action_count"])
+
+                iteration_actions["accepted"] = True
+                iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                iteration_actions["metric_delta_accept_metric"] = metric_delta
+                iteration_actions["accept_metric"] = config.accept_metric
+
+                for variant in VALID_ACCEPT_METRICS:
+                    accepted_avg_logL_per_token_by_variant[variant] = float(
+                        post_corpus_scores_iter[f"avg_logL_per_token_{variant}"]
+                    )
+                no_op_iters = 0
+            else:
+                best_failed = None
+                if candidate_results:
+                    best_failed = max(candidate_results, key=lambda r: float(r["metric_delta"]))
+                    selected_operation_for_iter = str(best_failed["candidate_op_name"])
+                logging.info(
+                    "[Iter %s] No candidate op improved %s metric by min_delta %.6f; applying no-op.",
+                    iter_idx + 1,
+                    config.accept_metric,
+                    float(config.accept_min_delta),
+                )
+                current_merged_df = prev_merged_df
+                schema_state = prev_schema_state
+                current_choices_list = prev_choices_list
+                current_prob_calibrator = prev_prob_calibrator
+                token_count_tokenizer = prev_token_count_tokenizer
+                split_cooldown = prev_split_cooldown
+                revise_cooldown = prev_revise_cooldown
+                add_cooldown_until = prev_add_cooldown_until
+                next_new_cluster_id = prev_next_new_cluster_id
+
+                metric_delta = float(best_failed["metric_delta"]) if best_failed is not None else np.nan
+                post_doc_scores_iter = pre_doc_scores_iter
+                post_corpus_scores_iter = pre_corpus_scores_iter
+                proposed_action_count = 0
+
+                iteration_actions = {"split": [], "merge": [], "remove": [], "revise": [], "add": []}
+                iteration_actions["selected_operation"] = selected_operation_for_iter
+                iteration_actions["accepted"] = False
+                iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                iteration_actions["metric_delta_accept_metric"] = metric_delta
+                iteration_actions["accept_metric"] = config.accept_metric
+                if best_failed is not None:
+                    iteration_actions["proposed_actions"] = dict(best_failed.get("iteration_actions", {}))
+                no_op_iters += 1
+
+            if should_compute_iter_metrics and post_corpus_scores_iter is not None:
+                logging.info(
+                    "[Iter %s] POST avg_logL_tok: oracle=%.6f, assigned=%.6f, soft=%.6f | "
+                    "PPL_tok: oracle=%.3f, assigned=%.3f, soft=%.3f",
+                    iter_idx + 1,
+                    float(post_corpus_scores_iter["avg_logL_per_token_oracle"]),
+                    float(post_corpus_scores_iter["avg_logL_per_token_assigned"]),
+                    float(post_corpus_scores_iter["avg_logL_per_token_soft"]),
+                    float(post_corpus_scores_iter["perplexity_token_oracle"]),
+                    float(post_corpus_scores_iter["perplexity_token_assigned"]),
+                    float(post_corpus_scores_iter["perplexity_token_soft"]),
+                )
+                if pre_corpus_scores_iter is not None:
+                    logging.info(
+                        "[Iter %s] DELTA (POST-PRE) %s avg_logL_tok=%.6f",
+                        iter_idx + 1,
+                        config.accept_metric,
+                        float(
+                            post_corpus_scores_iter[f"avg_logL_per_token_{config.accept_metric}"]
+                            - pre_corpus_scores_iter[f"avg_logL_per_token_{config.accept_metric}"]
+                        ),
+                    )
+
+            if bool(iteration_actions.get("accepted", False)) and proposed_action_count > 0 and selected_operation_for_iter:
+                if selected_operation_for_iter == last_selected_operation:
+                    same_operation_streak += 1
+                else:
+                    last_selected_operation = str(selected_operation_for_iter)
+                    same_operation_streak = 1
+                logging.info(
+                    "[Iter %s] Applied selected op '%s'. Current same-op streak=%s.",
+                    iter_idx + 1,
+                    selected_operation_for_iter,
+                    same_operation_streak,
+                )
+
+            unique_cluster_ids_after_iter = sorted(current_merged_df["cluster_id"].unique())
+            logging.info(
+                "Schema diff (iter %s): #labels=%s, adds=%s, splits=%s, merges=%s, removes=%s, revises=%s",
+                iter_idx + 1,
+                len(current_choices_list),
+                len(iteration_actions.get("add", [])),
+                len(iteration_actions.get("split", [])),
+                len(iteration_actions.get("merge", [])),
+                len(iteration_actions.get("remove", [])),
+                len(iteration_actions.get("revise", [])),
+            )
+
+            if log_iteration_metrics and post_corpus_scores_iter is not None:
+                delta_prepost_oracle = (
+                    float(post_corpus_scores_iter["avg_logL_per_token_oracle"] - pre_corpus_scores_iter["avg_logL_per_token_oracle"])
+                    if pre_corpus_scores_iter is not None else np.nan
+                )
+                delta_prepost_assigned = (
+                    float(post_corpus_scores_iter["avg_logL_per_token_assigned"] - pre_corpus_scores_iter["avg_logL_per_token_assigned"])
+                    if pre_corpus_scores_iter is not None else np.nan
+                )
+                delta_prepost_soft = (
+                    float(post_corpus_scores_iter["avg_logL_per_token_soft"] - pre_corpus_scores_iter["avg_logL_per_token_soft"])
+                    if pre_corpus_scores_iter is not None else np.nan
+                )
+                iteration_metrics_rows.append({
+                    "iter": int(iter_idx + 1),
+                    "clusters": int(len(unique_cluster_ids_after_iter)),
+                    "splits": int(len(iteration_actions.get("split", []))),
+                    "merges": int(len(iteration_actions.get("merge", []))),
+                    "removes": int(len(iteration_actions.get("remove", []))),
+                    "adds": int(len(iteration_actions.get("add", []))),
+                    "revises": int(len(iteration_actions.get("revise", []))),
+                    "selected_operation": iteration_actions.get("selected_operation"),
+                    "accept_metric": config.accept_metric,
+                    "accepted": bool(iteration_actions.get("accepted", True)),
+                    "delta_vs_best_avg_logL_tok": metric_delta,
+                    "delta_vs_best_accept_metric": metric_delta,
+                    "mismatch_rate": float(diag_summary["mismatch_rate"]) if diag_summary and diag_summary.get("mismatch_rate") is not None else np.nan,
+                    "pmax_median": float(diag_summary["pmax_median"]) if diag_summary and diag_summary.get("pmax_median") is not None else np.nan,
+                    "entropy_median": float(diag_summary["entropy_median"]) if diag_summary and diag_summary.get("entropy_median") is not None else np.nan,
+                    "L_baseline": float(post_doc_scores_iter["L_baseline"]),
+                    "token_count_total": float(post_corpus_scores_iter["token_count_total"]),
+                    "pre_avg_logL_per_token_oracle": float(pre_corpus_scores_iter["avg_logL_per_token_oracle"]) if pre_corpus_scores_iter is not None else np.nan,
+                    "pre_avg_logL_per_token_assigned": float(pre_corpus_scores_iter["avg_logL_per_token_assigned"]) if pre_corpus_scores_iter is not None else np.nan,
+                    "pre_avg_logL_per_token_soft": float(pre_corpus_scores_iter["avg_logL_per_token_soft"]) if pre_corpus_scores_iter is not None else np.nan,
+                    "pre_PPL_tok_oracle": float(pre_corpus_scores_iter["perplexity_token_oracle"]) if pre_corpus_scores_iter is not None else np.nan,
+                    "pre_PPL_tok_assigned": float(pre_corpus_scores_iter["perplexity_token_assigned"]) if pre_corpus_scores_iter is not None else np.nan,
+                    "pre_PPL_tok_soft": float(pre_corpus_scores_iter["perplexity_token_soft"]) if pre_corpus_scores_iter is not None else np.nan,
+                    "logL_total_oracle": float(post_corpus_scores_iter["logL_total_oracle"]),
+                    "logL_total_assigned": float(post_corpus_scores_iter["logL_total_assigned"]),
+                    "logL_total_soft": float(post_corpus_scores_iter["logL_total_soft"]),
+                    "avg_logL_per_token_oracle": float(post_corpus_scores_iter["avg_logL_per_token_oracle"]),
+                    "avg_logL_per_token_assigned": float(post_corpus_scores_iter["avg_logL_per_token_assigned"]),
+                    "avg_logL_per_token_soft": float(post_corpus_scores_iter["avg_logL_per_token_soft"]),
+                    "PPL_tok_oracle": float(post_corpus_scores_iter["perplexity_token_oracle"]),
+                    "PPL_tok_assigned": float(post_corpus_scores_iter["perplexity_token_assigned"]),
+                    "PPL_tok_soft": float(post_corpus_scores_iter["perplexity_token_soft"]),
+                    "delta_prepost_avg_logL_per_token_oracle": delta_prepost_oracle,
+                    "delta_prepost_avg_logL_per_token_assigned": delta_prepost_assigned,
+                    "delta_prepost_avg_logL_per_token_soft": delta_prepost_soft,
+                    "delta_prepost_PPL_tok_oracle": (
+                        float(post_corpus_scores_iter["perplexity_token_oracle"] - pre_corpus_scores_iter["perplexity_token_oracle"])
+                        if pre_corpus_scores_iter is not None else np.nan
+                    ),
+                    "delta_prepost_PPL_tok_assigned": (
+                        float(post_corpus_scores_iter["perplexity_token_assigned"] - pre_corpus_scores_iter["perplexity_token_assigned"])
+                        if pre_corpus_scores_iter is not None else np.nan
+                    ),
+                    "delta_prepost_PPL_tok_soft": (
+                        float(post_corpus_scores_iter["perplexity_token_soft"] - pre_corpus_scores_iter["perplexity_token_soft"])
+                        if pre_corpus_scores_iter is not None else np.nan
+                    ),
+                    "logL_total": float(post_corpus_scores_iter["logL_cond_total"]),
+                    "avg_logL_per_token": float(post_corpus_scores_iter["avg_logL_per_token"]),
+                    "AIC": float(post_corpus_scores_iter["AIC"]) if post_corpus_scores_iter["AIC"] is not None else np.nan,
+                    "BIC": float(post_corpus_scores_iter["BIC"]) if post_corpus_scores_iter["BIC"] is not None else np.nan,
+                    "PPL": float(post_corpus_scores_iter["perplexity"]),
+                    "PPL_tok": float(post_corpus_scores_iter["perplexity_token"]),
+                    "ELBO": float(post_corpus_scores_iter["ELBO"]),
+                })
+
+            schema_history.append(iteration_actions)
+            logging.info(f"=== EM Iteration {iter_idx + 1} Complete. #Clusters: {len(unique_cluster_ids_after_iter)} ===")
+
+            if verbose:
+                logging.info(f"Iteration {iter_idx + 1} - Schema Label Priors (P(z)) after updates:")
+                if not current_merged_df.empty and 'agglomerative_label' in current_merged_df.columns and current_merged_df['agglomerative_label'].notna().any():
+                    label_proportions = current_merged_df['agglomerative_label'].value_counts(normalize=True)
+                    for label, prob in label_proportions.items():
+                        logging.info(f"  P('{label}') = {prob:.4f}")
+                else:
+                    logging.info("  No data or agglomerative_labels to compute P(z) from current_merged_df.")
+
+            if no_op_iters >= max(1, int(config.noop_patience)):
+                logging.info(
+                    "Stopping early after %s consecutive no-op iterations (noop_patience=%s).",
+                    no_op_iters,
+                    config.noop_patience,
+                )
+                break
+            continue
         iteration_actions.update(actions)
+        iteration_actions["selected_operation"] = selected_operation_for_iter
         logging.info(f"Iteration {iter_idx + 1}: Actions decided from metrics (Split/Merge/Remove/Revise): {actions}. 'Add' actions to be determined next.")
         current_merged_df, next_new_cluster_id, split_pairs, merge_groups = apply_schema_updates(
             current_merged_df,
@@ -1617,110 +2813,105 @@ def em_schema_refinement(
             actions,
             next_new_cluster_id,
         )
-        if split_pairs:
-            for parent_id, _ in split_pairs:
-                split_cooldown[parent_id] = (iter_idx + 1) + config.split_cooldown_iters
-
-        # Rename split children (and parents) with meaningful labels based on exemplar texts
+        if actions.get("remove"):
+            current_merged_df = _reassign_removed_datapoints(
+                post_update_df=current_merged_df,
+                pre_update_df=prev_merged_df,
+                removed_cluster_ids=list(actions.get("remove", [])),
+                base_calibrator=current_prob_calibrator,
+                iter_number=iter_idx + 1,
+                log_details=True,
+            )
+        # Rename split children (and parents) with meaningful labels based on exemplar texts.
+        # Split labels are LLM-only: if we cannot obtain distinct parent/child names, revert that split pair.
         split_child_ids = {child for _, child in split_pairs}
         if split_pairs and config.operation_enabled("split"):
             shared_vllm_tokenizer = getattr(current_prob_calibrator, "vllm_tokenizer", None)
             shared_vllm_model = getattr(current_prob_calibrator, "vllm_model", None)
+            kept_split_pairs: list[tuple[int, int]] = []
             for parent_id, child_id in split_pairs:
                 parent_label = schema_state.label_map.get(parent_id, f"cluster_{parent_id}")
                 parent_texts = current_merged_df.loc[current_merged_df["cluster_id"] == parent_id, text_column_name].astype(str).tolist()
                 child_texts = current_merged_df.loc[current_merged_df["cluster_id"] == child_id, text_column_name].astype(str).tolist()
                 parent_samples = _sample_texts_for_labeling(parent_texts, max_texts=10, seed=int(parent_id))
                 child_samples = _sample_texts_for_labeling(child_texts, max_texts=10, seed=int(child_id))
-                parent_base = base_label(parent_label)
+                existing_forbidden_names = _collect_existing_cluster_labels(
+                    current_merged_df,
+                    exclude_cluster_ids={int(parent_id), int(child_id)},
+                )
 
-                new_parent_label = None
-                new_child_label = None
-                if config.operation_enabled("split") and model_type == "vllm":
-                    parent_llm = _label_cluster_vllm(
-                        parent_samples,
-                        model_identifier,
+                if config.structural_label_mode == "parent_relative":
+                    new_parent_label, new_child_label = _build_parent_relative_split_labels(
+                        parent_label=parent_label,
+                        parent_id=int(parent_id),
+                    )
+                elif model_type == "vllm":
+                    new_parent_label, new_child_label = _propose_split_labels_with_retries(
+                        parent_samples=parent_samples,
+                        child_samples=child_samples,
+                        parent_label=parent_label,
+                        model_identifier=model_identifier,
                         tokenizer=shared_vllm_tokenizer,
                         model=shared_vllm_model,
-                        contrast_texts=child_samples,
-                        parent_label=parent_base,
-                        context=f"split_parent:{parent_id}",
+                        context_prefix=f"split:{parent_id}->{child_id}",
+                        existing_forbidden_names=existing_forbidden_names,
+                        pair_attempts=config.split_label_pair_attempts,
+                        llm_label_max_attempts=config.llm_label_max_attempts,
                     )
-                    if parent_llm:
-                        name, _, keywords = parent_llm
-                        new_parent_label = build_label_string(name or parent_base, keywords)
+                else:
+                    new_parent_label, new_child_label = _build_parent_relative_split_labels(
+                        parent_label=parent_label,
+                        parent_id=int(parent_id),
+                    )
 
-                if not new_parent_label:
-                    logging.info(
-                        "Split relabel fallback for parent cluster %s: using heuristic label generation.",
+                parent_key = _canonical_label_key(new_parent_label)
+                child_key = _canonical_label_key(new_child_label)
+                pair_near_dupe = False
+                if parent_key and child_key:
+                    pair_near_dupe = bool(
+                        detect_near_duplicate_labels(
+                            [new_parent_label, new_child_label],
+                            threshold=DUP_LABEL_SIM_THRESHOLD,
+                        )
+                    )
+                existing_label_keys = {
+                    _canonical_label_key(lbl)
+                    for cid, lbl in current_merged_df.groupby("cluster_id")["agglomerative_label"].first().items()
+                    if int(cid) not in {int(parent_id), int(child_id)}
+                }
+                collides_existing_label = bool(
+                    (parent_key and parent_key in existing_label_keys)
+                    or (child_key and child_key in existing_label_keys)
+                )
+
+                if (
+                    not new_parent_label
+                    or not new_child_label
+                    or not parent_key
+                    or not child_key
+                    or parent_key == child_key
+                    or pair_near_dupe
+                    or collides_existing_label
+                ):
+                    logging.warning(
+                        "Reverting split (%s -> %s): LLM failed to produce distinct child labels "
+                        "(parent='%s', child='%s', collides_existing=%s).",
                         parent_id,
-                    )
-                    new_parent_label = _fallback_distinct_label_from_texts(parent_samples, banned_names=[parent_base])
-                    if not new_parent_label:
-                        name, keywords = propose_label_and_keywords_from_texts(parent_samples, parent_label=None, max_keywords=6)
-                        new_parent_label = build_label_string(name, keywords)
-
-                if config.operation_enabled("split") and model_type == "vllm":
-                    child_llm = _label_cluster_vllm(
-                        child_samples,
-                        model_identifier,
-                        tokenizer=shared_vllm_tokenizer,
-                        model=shared_vllm_model,
-                        contrast_texts=parent_samples,
-                        parent_label=parent_base,
-                        banned_names=[new_parent_label, parent_base],
-                        context=f"split_child:{child_id}",
-                    )
-                    if child_llm:
-                        name, _, keywords = child_llm
-                        new_child_label = build_label_string(name or "Split Child", keywords)
-
-                if not new_child_label:
-                    logging.info(
-                        "Split relabel fallback for child cluster %s: using heuristic label generation.",
                         child_id,
+                        new_parent_label,
+                        new_child_label,
+                        collides_existing_label,
                     )
-                    new_child_label = _fallback_distinct_label_from_texts(
-                        child_samples,
-                        banned_names=[new_parent_label, parent_base],
-                    )
-                    if not new_child_label:
-                        name, keywords = propose_label_and_keywords_from_texts(
-                            child_samples,
-                            parent_label=None,
-                            max_keywords=6,
-                        )
-                        new_child_label = build_label_string(name, keywords)
-
-                if _canonical_label_key(new_child_label) == _canonical_label_key(new_parent_label):
-                    if config.operation_enabled("split") and model_type == "vllm":
-                        child_llm_retry = _label_cluster_vllm(
-                            child_samples,
-                            model_identifier,
-                            tokenizer=shared_vllm_tokenizer,
-                            model=shared_vllm_model,
-                            contrast_texts=parent_samples,
-                            parent_label=parent_base,
-                            banned_names=[new_parent_label, parent_base, new_child_label],
-                            context=f"split_child_retry:{child_id}",
-                        )
-                        if child_llm_retry:
-                            name, _, keywords = child_llm_retry
-                            new_child_label = build_label_string(name or "Split Child", keywords)
-
-                if _canonical_label_key(new_child_label) == _canonical_label_key(new_parent_label):
-                    retry_fallback = _fallback_distinct_label_from_texts(
-                        child_samples,
-                        banned_names=[new_parent_label, parent_base, new_child_label],
-                    )
-                    if retry_fallback:
-                        new_child_label = retry_fallback
-
-                if _canonical_label_key(new_child_label) == _canonical_label_key(new_parent_label):
-                    new_child_label = build_label_string(f"{base_label(new_parent_label)}__c{child_id}")
+                    current_merged_df.loc[current_merged_df["cluster_id"] == child_id, "cluster_id"] = parent_id
+                    current_merged_df.loc[current_merged_df["cluster_id"] == parent_id, "agglomerative_label"] = parent_label
+                    continue
 
                 current_merged_df.loc[current_merged_df["cluster_id"] == parent_id, "agglomerative_label"] = new_parent_label
                 current_merged_df.loc[current_merged_df["cluster_id"] == child_id, "agglomerative_label"] = new_child_label
+                kept_split_pairs.append((parent_id, child_id))
+            split_pairs = kept_split_pairs
+            split_child_ids = {child for _, child in split_pairs}
+            iteration_actions["split"] = [p for p, _ in split_pairs]
 
         if merge_groups and config.operation_enabled("merge"):
             shared_vllm_tokenizer = getattr(current_prob_calibrator, "vllm_tokenizer", None)
@@ -1737,21 +2928,35 @@ def em_schema_refinement(
                 ].astype(str).tolist()
                 merged_samples = _sample_texts_for_labeling(merged_texts, max_texts=12, seed=int(root_id))
                 new_merge_label = None
-                if model_type == "vllm":
+                existing_forbidden_names = _collect_existing_cluster_labels(
+                    current_merged_df,
+                    exclude_cluster_ids={int(root_id)},
+                )
+                merge_banned_names = list(existing_forbidden_names) + list(source_labels)
+                if config.structural_label_mode == "parent_relative":
+                    new_merge_label = _build_parent_relative_merge_label(
+                        source_labels=[str(x) for x in source_labels],
+                        root_id=int(root_id),
+                    )
+                elif model_type == "vllm":
                     llm_label = _label_cluster_vllm(
                         merged_samples,
                         model_identifier,
                         tokenizer=shared_vllm_tokenizer,
                         model=shared_vllm_model,
                         parent_label=" + ".join(base_label(lbl) for lbl in source_labels[:2]),
-                        banned_names=source_labels,
+                        banned_names=merge_banned_names,
                         context=f"merge_cluster:{root_id}",
+                        max_attempts=config.llm_label_max_attempts,
                     )
                     if llm_label:
                         name, _, keywords = llm_label
                         new_merge_label = build_label_string(name, keywords)
                 if not new_merge_label:
-                    new_merge_label = _fallback_distinct_label_from_texts(merged_samples, banned_names=source_labels)
+                    new_merge_label = _fallback_distinct_label_from_texts(
+                        merged_samples,
+                        banned_names=merge_banned_names,
+                    )
                     if not new_merge_label:
                         name, keywords = propose_label_and_keywords_from_texts(merged_samples, parent_label=None)
                         new_merge_label = build_label_string(name, keywords)
@@ -1785,6 +2990,7 @@ def em_schema_refinement(
                         parent_label=base_label(current_label),
                         banned_names=[current_label],
                         context=f"revise_cluster:{cid}",
+                        max_attempts=config.llm_label_max_attempts,
                     )
                     if llm_label:
                         name, _, keywords = llm_label
@@ -1801,27 +3007,45 @@ def em_schema_refinement(
             for cid in revised_clusters_applied:
                 revise_cooldown[cid] = (iter_idx + 1) + config.revise_cooldown_iters
 
-        # Rename any exact duplicates to avoid suffixes like __cXYZ
+        # Rename any exact duplicates before final schema rebuild.
         dup_renamed = _rename_duplicate_labels(current_merged_df, text_column_name)
 
-        # Near-duplicate guardrail: revert split children if labels are too similar
+        # Near-duplicate guardrail: revert any remaining problematic split pairs (pair-local only)
         duplicates_prevented = False
         if split_pairs:
-            labels_now = current_merged_df.groupby("cluster_id")["agglomerative_label"].first().astype(str).tolist()
-            dup_pairs = detect_near_duplicate_labels(labels_now, threshold=DUP_LABEL_SIM_THRESHOLD)
-            if dup_pairs:
-                duplicates_prevented = True
-                logging.warning(
-                    "Near-duplicate labels detected after split; reverting split children: %s",
-                    split_child_ids,
+            still_kept_pairs: list[tuple[int, int]] = []
+            for parent_id, child_id in split_pairs:
+                if child_id not in set(current_merged_df["cluster_id"].unique()):
+                    continue
+                parent_label_now = str(current_merged_df.loc[current_merged_df["cluster_id"] == parent_id, "agglomerative_label"].iloc[0])
+                child_label_now = str(current_merged_df.loc[current_merged_df["cluster_id"] == child_id, "agglomerative_label"].iloc[0])
+                pair_dup = bool(
+                    detect_near_duplicate_labels(
+                        [parent_label_now, child_label_now],
+                        threshold=DUP_LABEL_SIM_THRESHOLD,
+                    )
                 )
-                for parent_id, child_id in split_pairs:
+                if pair_dup or _canonical_label_key(parent_label_now) == _canonical_label_key(child_label_now):
+                    duplicates_prevented = True
+                    logging.warning(
+                        "Near-duplicate split labels for (%s -> %s): parent='%s' child='%s'. Reverting this split pair.",
+                        parent_id,
+                        child_id,
+                        parent_label_now,
+                        child_label_now,
+                    )
                     current_merged_df.loc[current_merged_df["cluster_id"] == child_id, "cluster_id"] = parent_id
-                # Rebuild labels after reverting
-                current_merged_df["agglomerative_label"] = current_merged_df["cluster_id"].map(
-                    current_merged_df.groupby("cluster_id")["agglomerative_label"].first().to_dict()
-                )
-                split_child_ids = set()
+                else:
+                    still_kept_pairs.append((parent_id, child_id))
+            split_pairs = still_kept_pairs
+            split_child_ids = {child for _, child in split_pairs}
+            iteration_actions["split"] = [p for p, _ in split_pairs]
+            current_merged_df["agglomerative_label"] = current_merged_df["cluster_id"].map(
+                current_merged_df.groupby("cluster_id")["agglomerative_label"].first().to_dict()
+            )
+        if split_pairs:
+            for parent_id, _ in split_pairs:
+                split_cooldown[parent_id] = (iter_idx + 1) + config.split_cooldown_iters
         
         # Log P(z|X) for each datapoint if verbose
         if verbose:
@@ -1860,11 +3084,13 @@ def em_schema_refinement(
         added_clusters_info = []
         if not config.operation_enabled("add"):
             logging.info("  Skipping add-step because add operation is disabled by tune configuration.")
-        elif schema_unstable:
-            logging.info("  Skipping add-step due to schema instability (splits/merges/removes or duplicate guardrail).")
         elif iter_idx + 1 <= add_cooldown_until:
             logging.info("  Skipping add-step due to cooldown (last add in iter %s).", add_cooldown_until - 1)
         else:
+            if schema_unstable:
+                logging.info(
+                    "  Proceeding with add-step even after structural changes (split/merge/remove/duplicate guardrail)."
+                )
             poor_indices = []
             pmax_vals = []
             entropy_vals = []
@@ -1971,6 +3197,7 @@ def em_schema_refinement(
                                         tokenizer=getattr(current_prob_calibrator, "vllm_tokenizer", None),
                                         model=getattr(current_prob_calibrator, "vllm_model", None),
                                         context=f"add_cluster:{assigned_new_id}",
+                                        max_attempts=config.llm_label_max_attempts,
                                     )
                                     if llm_label:
                                         name, _, keywords = llm_label
@@ -2015,6 +3242,13 @@ def em_schema_refinement(
                 add_cooldown_until = (iter_idx + 1) + config.add_cooldown_iters
 
         iteration_actions['add'] = added_clusters_info
+        if (
+            config.best_operation_per_iteration
+            and config.tune_operation == "all"
+            and iteration_actions.get("selected_operation") is None
+            and len(added_clusters_info) > 0
+        ):
+            iteration_actions["selected_operation"] = "add"
         logging.info(f"Iteration {iter_idx + 1}: 'Add' actions decided: {added_clusters_info}. Total actions for iteration: {iteration_actions}")
         if current_merged_df.empty:
             logging.warning(f"Iteration {iter_idx + 1}: Dataframe became empty after updates. Stopping EM refinement.")
@@ -2225,6 +3459,21 @@ def em_schema_refinement(
             else:
                 no_op_iters = 0
 
+        if config.best_operation_per_iteration and config.tune_operation == "all":
+            applied_op = iteration_actions.get("selected_operation")
+            if bool(iteration_actions.get("accepted", True)) and proposed_action_count > 0 and applied_op:
+                if applied_op == last_selected_operation:
+                    same_operation_streak += 1
+                else:
+                    last_selected_operation = str(applied_op)
+                    same_operation_streak = 1
+                logging.info(
+                    "[Iter %s] Applied selected op '%s'. Current same-op streak=%s.",
+                    iter_idx + 1,
+                    applied_op,
+                    same_operation_streak,
+                )
+
         if log_iteration_metrics and post_corpus_scores_iter is not None:
             delta_prepost_oracle = (
                 float(post_corpus_scores_iter["avg_logL_per_token_oracle"] - pre_corpus_scores_iter["avg_logL_per_token_oracle"])
@@ -2246,6 +3495,7 @@ def em_schema_refinement(
                 "removes": int(len(iteration_actions.get("remove", []))),
                 "adds": int(len(iteration_actions.get("add", []))),
                 "revises": int(len(iteration_actions.get("revise", []))),
+                "selected_operation": iteration_actions.get("selected_operation"),
                 "accept_metric": config.accept_metric,
                 "accepted": bool(iteration_actions.get("accepted", True)),
                 "delta_vs_best_avg_logL_tok": metric_delta,
@@ -2343,7 +3593,7 @@ def em_schema_refinement(
                 metrics_df[f"delta_{metric_col}"] = metrics_df[metric_col].diff()
 
         display_cols = [
-            "iter", "clusters", "splits", "merges", "removes", "adds", "revises", "accepted", "accept_metric", "delta_vs_best_accept_metric",
+            "iter", "clusters", "splits", "merges", "removes", "adds", "revises", "selected_operation", "accepted", "accept_metric", "delta_vs_best_accept_metric",
             "mismatch_rate", "pmax_median", "entropy_median",
             "logL_total_oracle", "logL_total_assigned", "logL_total_soft",
             "avg_logL_per_token_oracle", "avg_logL_per_token_assigned", "avg_logL_per_token_soft",
@@ -2516,6 +3766,11 @@ def main(args):
             accept_metric=args.accept_metric,
             accept_min_delta=args.accept_min_delta,
             noop_patience=args.noop_patience,
+            best_operation_per_iteration=args.best_operation_per_iteration,
+            max_same_operation_streak=args.max_same_operation_streak,
+            structural_label_mode=args.structural_label_mode,
+            split_label_pair_attempts=args.split_label_pair_attempts,
+            llm_label_max_attempts=args.llm_label_max_attempts,
         )
         merged_df, schema_history, choices_list, prob_calibrator = em_schema_refinement(
             merged_df,
@@ -2609,6 +3864,29 @@ if __name__ == "__main__":
         default="all",
         help="Run all operations or isolate one operation for threshold tuning.",
     )
+    parser.add_argument(
+        "--structural_label_mode",
+        type=str,
+        choices=list(VALID_STRUCTURAL_LABEL_MODES),
+        default="semantic",
+        help=(
+            "Labeling mode for structural ops (split/merge): "
+            "'semantic' uses LLM-generated labels, 'parent_relative' uses deterministic labels like "
+            "'<parent> Parent Zk' / '<parent> Child Zk' to reduce rename noise."
+        ),
+    )
+    parser.add_argument(
+        "--split_label_pair_attempts",
+        type=int,
+        default=3,
+        help="Number of parent/child pair relabel retries for each split before reverting that split pair.",
+    )
+    parser.add_argument(
+        "--llm_label_max_attempts",
+        type=int,
+        default=6,
+        help="Max internal retries per LLM labeling call before fallback.",
+    )
 
     # Split config
     parser.add_argument(
@@ -2683,6 +3961,18 @@ if __name__ == "__main__":
     parser.add_argument("--accept_metric", type=str, choices=list(VALID_ACCEPT_METRICS), default="assigned", help="Metric variant used for rollback gating: assigned, soft, or oracle.")
     parser.add_argument("--accept_min_delta", type=float, default=0.0, help="Minimum delta in the selected accept metric (avg_logL_per_token_<variant>) required to accept an iteration update.")
     parser.add_argument("--noop_patience", type=int, default=2, help="Early-stop after this many consecutive no-op iterations.")
+    parser.add_argument(
+        "--best_operation_per_iteration",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If enabled with tune_operation=all, evaluate split/merge/remove/add separately each iteration and apply only the best-scoring operation.",
+    )
+    parser.add_argument(
+        "--max_same_operation_streak",
+        type=int,
+        default=0,
+        help="When best_operation_per_iteration is enabled, disallow picking the same winning operation more than this many consecutive iterations (0 disables).",
+    )
 
     args = parser.parse_args()
     main(args)

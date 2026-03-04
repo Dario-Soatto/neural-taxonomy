@@ -16,11 +16,22 @@ OPERATION_GRIDS = {
             "--split_confidence_max": [0.20, 0.30, 0.40],
             "--split_gap_median_min": [0.08, 0.12, 0.18],
             "--split_min_cluster_size": [15, 25],
+            "--split_min_conditions": [2],
         },
         "fast": {
             "--split_ll_margin": [5.0, 7.0],
             "--split_confidence_max": [0.25, 0.35],
             "--split_gap_median_min": [0.10, 0.16],
+            "--split_min_conditions": [2],
+        },
+        # Non-fast structural tuning profile (exactly 10 configs):
+        # 5 (confidence) x 2 (ll margin) = 10
+        "structural": {
+            "--split_ll_margin": [4.0, 7.0],
+            "--split_confidence_max": [0.14, 0.20, 0.26, 0.32, 0.38],
+            "--split_gap_median_min": [0.16],
+            "--split_min_cluster_size": [25],
+            "--split_min_conditions": [2],
         },
     },
     "merge": {
@@ -28,11 +39,21 @@ OPERATION_GRIDS = {
             "--merge_similarity_min": [0.78, 0.84, 0.90],
             "--merge_l_diff_ratio_max": [0.08, 0.15],
             "--merge_c_diff_ratio_max": [0.08, 0.15],
+            "--merge_min_conditions": [2],
         },
         "fast": {
             "--merge_similarity_min": [0.80, 0.88],
             "--merge_l_diff_ratio_max": [0.10],
             "--merge_c_diff_ratio_max": [0.10],
+            "--merge_min_conditions": [2],
+        },
+        # Non-fast structural tuning profile (exactly 10 configs):
+        # 5 (similarity) x 2 (L-diff ratio) = 10
+        "structural": {
+            "--merge_similarity_min": [0.55, 0.65, 0.75, 0.85, 0.92],
+            "--merge_l_diff_ratio_max": [0.06, 0.12],
+            "--merge_c_diff_ratio_max": [0.15],
+            "--merge_min_conditions": [2],
         },
     },
     "remove": {
@@ -44,17 +65,31 @@ OPERATION_GRIDS = {
             "--remove_min_cluster_size": [4, 7],
             "--remove_ll_factor": [1.00, 1.02],
         },
+        # Non-fast structural tuning profile (exactly 10 configs):
+        # 2 (size) x 5 (ll_factor) = 10
+        # Includes looser ll_factor values to expose remove behavior in tiny, weak clusters.
+        "structural": {
+            "--remove_min_cluster_size": [4, 8],
+            "--remove_ll_factor": [0.55, 0.65, 0.75, 0.85, 0.95],
+        },
     },
     "revise": {
         "coarse": {
             "--revise_ll_margin": [3.0, 4.0, 6.0],
             "--revise_confidence_max": [0.20, 0.30, 0.40],
-            "--revise_min_conditions": [1, 2],
+            "--revise_min_conditions": [2],
         },
         "fast": {
             "--revise_ll_margin": [3.0, 5.0],
             "--revise_confidence_max": [0.25, 0.35],
-            "--revise_min_conditions": [1],
+            "--revise_min_conditions": [2],
+        },
+        # Non-fast structural tuning profile (exactly 10 configs):
+        # 5 (ll margin) x 2 (confidence) = 10
+        "structural": {
+            "--revise_ll_margin": [2.0, 3.5, 5.0, 6.5, 8.0],
+            "--revise_confidence_max": [0.15, 0.30],
+            "--revise_min_conditions": [2],
         },
     },
     "add": {
@@ -67,6 +102,18 @@ OPERATION_GRIDS = {
             "--add_low_confidence_max": [0.18, 0.24],
             "--add_min_poorly_explained": [15, 35],
             "--add_items_per_new_cluster": [50, 100],
+        },
+        # Non-fast structural tuning profile (exactly 10 configs):
+        # 5 (low_confidence_max) x 2 (dynamic quantile) = 10
+        # Looser grouping/diversity gates to expose add behavior.
+        "structural": {
+            "--add_low_confidence_max": [0.18, 0.24, 0.30, 0.36, 0.42],
+            "--add_low_confidence_quantile": [0.05, 0.15],
+            "--add_min_poorly_explained": [8],
+            "--add_items_per_new_cluster": [20],
+            "--add_min_group_size": [2],
+            "--add_entropy_min": [0.75],
+            "--add_cohesion_min": [0.05],
         },
     },
 }
@@ -184,7 +231,7 @@ def main():
         description="Grid-search EM thresholds for one operation at a time."
     )
     parser.add_argument("--operation", choices=["split", "merge", "remove", "add", "revise"], required=True)
-    parser.add_argument("--grid_profile", choices=["coarse", "fast"], default="coarse")
+    parser.add_argument("--grid_profile", choices=["coarse", "fast", "structural"], default="coarse")
     parser.add_argument("--output_root", type=str, required=True)
     parser.add_argument("--python_executable", type=str, default=sys.executable)
     parser.add_argument(

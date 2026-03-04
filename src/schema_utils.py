@@ -69,12 +69,18 @@ def dedupe_tokens(tokens: list[str]) -> list[str]:
     return out
 
 
-def build_label_string(name: str, keywords: list[str] | None = None) -> str:
+def build_label_string(
+    name: str,
+    keywords: list[str] | None = None,
+    include_keywords: bool = False,
+) -> str:
     name = base_label(name)
     if not name:
         name = "Misc"
     name = name[:40]
-    if keywords:
+    # Keep schema labels as single phrases by default. Keyword suffixes
+    # ("Label: kw1 kw2") can be re-enabled explicitly for legacy behavior.
+    if include_keywords and keywords:
         kws = [sanitize_text(k) for k in keywords if sanitize_text(k)]
         kws = dedupe_tokens(kws)[:8]
         if kws:

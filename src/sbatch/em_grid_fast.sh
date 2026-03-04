@@ -93,10 +93,13 @@ python src/em_threshold_grid_search.py \
   --scorer_type batch \
   --num_iterations "${EM_NUM_ITERATIONS}" \
   --accept_metric assigned \
+  --split_min_conditions 2 \
   --split_max_per_iter 0 \
   --split_cooldown_iters 0 \
+  --merge_min_conditions 2 \
   --merge_max_per_iter 0 \
   --remove_max_per_iter 0 \
+  --revise_min_conditions 2 \
   --revise_max_per_iter 0 \
   --revise_cooldown_iters 0 \
   --add_max_new_clusters_per_iter 50 \
