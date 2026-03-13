@@ -43,6 +43,18 @@ def main():
     parser.add_argument("--subset", type=str, default="all",
                         choices=["train", "test", "all"],
                         help="Which split of 20 Newsgroups to use.")
+    parser.add_argument(
+        "--max_words",
+        type=int,
+        default=0,
+        help="If >0, truncate each document to this many whitespace-delimited words before embedding.",
+    )
+    parser.add_argument(
+        "--max_chars",
+        type=int,
+        default=0,
+        help="If >0, truncate each document to this many characters before embedding.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -72,6 +84,10 @@ def main():
     kept_labels = []
     for txt, lbl in zip(texts, true_labels):
         txt = txt.strip()
+        if args.max_words > 0:
+            txt = " ".join(txt.split()[: args.max_words])
+        if args.max_chars > 0:
+            txt = txt[: args.max_chars]
         if len(txt) >= 20:
             cleaned.append(txt)
             kept_labels.append(lbl)

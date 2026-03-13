@@ -32,9 +32,12 @@
 
 set -euo pipefail
 
-REPO_DIR="/nlp/scr/soatto/neural-taxonomy"
-EXPERIMENT_DIR="experiments/wiki_biographies_10000"
-MODEL_NAME="meta-llama/Meta-Llama-3.1-8B-Instruct"
+REPO_DIR="${REPO_DIR:-/nlp/scr/soatto/neural-taxonomy}"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-experiments/wiki_biographies_10000}"
+MODEL_NAME="${MODEL_NAME:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
+PROPORTIONAL_THRESHOLDS="${PROPORTIONAL_THRESHOLDS:-0}"
+ADAPTIVE_PROPOSAL_THRESHOLDS="${ADAPTIVE_PROPOSAL_THRESHOLDS:-0}"
+ADAPTIVE_THRESHOLD_MAX_RELAX_ITERS="${ADAPTIVE_THRESHOLD_MAX_RELAX_ITERS:-3}"
 
 RUN_TAG="$(date +%Y%m%d_%H%M%S)_j${SLURM_JOB_ID:-manual}"
 OUTPUT_DIR="em_runs_llm_only/${RUN_TAG}"
@@ -104,65 +107,91 @@ trap cleanup EXIT
 
 print_mem_snapshot
 
-python src/run_em_algorithm_llm_only.py \
-  --experiment_dir "${EXPERIMENT_DIR}" \
-  --sentence_data_path "${EXPERIMENT_DIR}/models/all_extracted_discourse_with_clusters_and_text.csv" \
-  --output_file "${OUTPUT_FILE}" \
-  --diagnostics_dir "${DIAGNOSTICS_DIR}" \
-  --num_agglomerative_clusters 10 \
-  --num_datapoints_per_cluster 50 \
-  --subsample_seed 13 \
-  --model_type vllm \
-  --model_name "${MODEL_NAME}" \
-  --sentence_column_name sentence_text \
-  --log_sentence_samples 3 \
-  --num_trials 3 \
-  --scorer_type batch \
-  --num_iterations 5 \
-  --tune_operation all \
-  --accept_metric assigned \
-  --accept_min_delta 0.0 \
-  --structural_label_mode semantic \
-  --split_label_pair_attempts 3 \
-  --llm_label_max_attempts 6 \
-  --best_operation_per_iteration \
-  --max_same_operation_streak 2 \
-  --split_enabled \
-  --split_ll_margin 4.0 \
-  --split_confidence_max 0.32 \
-  --split_gap_median_min 0.16 \
-  --split_min_cluster_size 25 \
-  --split_min_conditions 2 \
-  --split_max_per_iter 0 \
-  --split_cooldown_iters 0 \
-  --merge_enabled \
-  --merge_similarity_min 0.15 \
-  --merge_l_diff_ratio_max 0.12 \
-  --merge_c_diff_ratio_max 0.15 \
-  --merge_min_conditions 2 \
-  --merge_max_per_iter 0 \
-  --remove_enabled \
-  --remove_min_cluster_size 8 \
-  --remove_ll_factor 0.65 \
-  --remove_max_per_iter 0 \
-  --no-revise_enabled \
-  --revise_max_per_iter 0 \
-  --revise_cooldown_iters 0 \
-  --add_enabled \
-  --add_low_confidence_max 0.30 \
-  --add_low_confidence_quantile 0.15 \
-  --add_min_poorly_explained 8 \
-  --add_items_per_new_cluster 20 \
-  --add_min_group_size 2 \
-  --add_entropy_min 0.75 \
-  --add_cohesion_min 0.05 \
-  --add_max_new_clusters_per_iter 50 \
-  --add_cooldown_iters 0 \
-  --noop_patience 1 \
-  --log_iteration_metrics \
-  --log_top_pairs 5 \
-  --diagnostics_sample_size 50 \
+echo "========================================"
+echo "Wiki biographies LLM-only EM run"
+echo "Repo:                ${REPO_DIR}"
+echo "Experiment:          ${EXPERIMENT_DIR}"
+echo "Model:               ${MODEL_NAME}"
+echo "Proportional props:  ${PROPORTIONAL_THRESHOLDS}"
+echo "Adaptive props:      ${ADAPTIVE_PROPOSAL_THRESHOLDS}"
+echo "Adaptive max relax:  ${ADAPTIVE_THRESHOLD_MAX_RELAX_ITERS}"
+echo "========================================"
+
+EM_ARGS=(
+  --experiment_dir "${EXPERIMENT_DIR}"
+  --sentence_data_path "${EXPERIMENT_DIR}/models/all_extracted_discourse_with_clusters_and_text.csv"
+  --output_file "${OUTPUT_FILE}"
+  --diagnostics_dir "${DIAGNOSTICS_DIR}"
+  --num_agglomerative_clusters 10
+  --num_datapoints_per_cluster 50
+  --subsample_seed 13
+  --model_type vllm
+  --model_name "${MODEL_NAME}"
+  --sentence_column_name sentence_text
+  --log_sentence_samples 3
+  --num_trials 3
+  --scorer_type batch
+  --num_iterations 5
+  --tune_operation all
+  --accept_metric assigned
+  --accept_min_delta 0.0
+  --structural_label_mode semantic
+  --split_label_pair_attempts 3
+  --llm_label_max_attempts 6
+  --best_operation_per_iteration
+  --max_same_operation_streak 2
+  --split_enabled
+  --split_ll_margin 4.0
+  --split_confidence_max 0.32
+  --split_gap_median_min 0.16
+  --split_min_cluster_size 25
+  --split_min_conditions 2
+  --split_max_per_iter 0
+  --split_cooldown_iters 0
+  --merge_enabled
+  --merge_similarity_min 0.15
+  --merge_l_diff_ratio_max 0.12
+  --merge_c_diff_ratio_max 0.15
+  --merge_min_conditions 2
+  --merge_max_per_iter 0
+  --remove_enabled
+  --remove_min_cluster_size 8
+  --remove_ll_factor 0.65
+  --remove_max_per_iter 0
+  --no-revise_enabled
+  --revise_max_per_iter 0
+  --revise_cooldown_iters 0
+  --add_enabled
+  --add_low_confidence_max 0.30
+  --add_low_confidence_quantile 0.15
+  --add_min_poorly_explained 8
+  --add_items_per_new_cluster 20
+  --add_min_group_size 2
+  --add_entropy_min 0.75
+  --add_cohesion_min 0.05
+  --add_max_new_clusters_per_iter 50
+  --add_cooldown_iters 0
+  --noop_patience 1
+  --log_iteration_metrics
+  --log_top_pairs 5
+  --diagnostics_sample_size 50
   --embedding_model_name sentence-transformers/all-MiniLM-L6-v2
+  --adaptive_threshold_max_relax_iters "${ADAPTIVE_THRESHOLD_MAX_RELAX_ITERS}"
+)
+
+if [[ "${PROPORTIONAL_THRESHOLDS}" == "1" ]]; then
+  EM_ARGS+=(--proposal_proportional_thresholds)
+else
+  EM_ARGS+=(--no-proposal_proportional_thresholds)
+fi
+
+if [[ "${ADAPTIVE_PROPOSAL_THRESHOLDS}" == "1" ]]; then
+  EM_ARGS+=(--proposal_adaptive_thresholds)
+else
+  EM_ARGS+=(--no-proposal_adaptive_thresholds)
+fi
+
+python src/run_em_algorithm_llm_only.py "${EM_ARGS[@]}"
 
 echo "LLM-only EM run completed."
 echo "Output directory: ${OUTPUT_DIR}"

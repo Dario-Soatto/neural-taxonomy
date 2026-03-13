@@ -32,6 +32,8 @@ from schema_utils import (
 VALID_TUNE_OPERATIONS = ("all", "split", "merge", "remove", "add", "revise")
 VALID_ACCEPT_METRICS = ("assigned", "soft", "oracle")
 VALID_STRUCTURAL_LABEL_MODES = ("semantic", "parent_relative")
+VALID_SPLIT_SIZE_GATE_MODES = ("fixed", "mean_ratio", "off")
+VALID_MERGE_EPSILON_MODES = ("fixed", "quantile")
 DUP_LABEL_SIM_THRESHOLD = 0.90   # Near-duplicate label similarity threshold
 
 
@@ -42,6 +44,11 @@ class SchemaRefinementConfig:
     split_enabled: bool = True
     split_max_per_iter: int = 1
     split_min_cluster_size: int = 20
+    split_size_gate_mode: str = "fixed"
+    split_min_cluster_size_mean_ratio: float = 0.50
+    split_l_bottom_quantile: float = 0.25
+    split_c_bottom_quantile: float = 0.25
+    split_v_top_quantile: float = 0.75
     split_ll_margin: float = 6.0
     split_confidence_max: float = 0.30
     split_gap_median_min: float = 0.10
@@ -51,6 +58,11 @@ class SchemaRefinementConfig:
     merge_enabled: bool = True
     merge_max_per_iter: int = 1
     merge_similarity_min: float = 0.80
+    merge_epsilon_mode: str = "fixed"
+    merge_l_abs_diff_quantile: float = 0.25
+    merge_c_abs_diff_quantile: float = 0.25
+    merge_l_abs_diff_max: float = 12.0
+    merge_c_abs_diff_max: float = 0.10
     merge_l_diff_ratio_max: float = 0.10
     merge_c_diff_ratio_max: float = 0.10
     merge_min_conditions: int = 1
@@ -544,11 +556,16 @@ def decide_schema_updates(
     split_cooldown: dict[int, int],
     revise_cooldown: dict[int, int],
     iter_idx: int,
+    independent_operation_proposals: bool = False,
     verbose: bool = False,
     log_top_pairs: int = 0,
 ):
     """Determine which clusters to split, merge, remove. Returns dictionaries describing actions."""
     logging.info("Starting schema update decisions...")
+    if independent_operation_proposals:
+        logging.info(
+            "Independent proposal mode enabled: split/merge/remove candidates are generated without cross-operation exclusions."
+        )
     actions = {'split': [], 'merge': [], 'remove': [], 'revise': []}
     split_enabled = config.operation_enabled("split")
     merge_enabled = config.operation_enabled("merge")
@@ -565,13 +582,31 @@ def decide_schema_updates(
         logging.warning("No valid cluster data found in cluster_metrics for schema update decisions.")
         return actions
 
-    median_V_z = np.median([cluster_metrics[cid]['V_z'] for cid in valid_cluster_ids if 'V_z' in cluster_metrics[cid]])
+    l_vals = np.array([cluster_metrics[cid]['L_z'] for cid in valid_cluster_ids], dtype=float)
+    c_vals = np.array([cluster_metrics[cid]['C_z'] for cid in valid_cluster_ids], dtype=float)
+    v_vals = np.array([cluster_metrics[cid]['V_z'] for cid in valid_cluster_ids], dtype=float)
+    split_l_thresh = float(np.quantile(l_vals, np.clip(config.split_l_bottom_quantile, 0.0, 1.0)))
+    split_c_thresh = float(np.quantile(c_vals, np.clip(config.split_c_bottom_quantile, 0.0, 1.0)))
+    split_v_thresh = float(np.quantile(v_vals, np.clip(config.split_v_top_quantile, 0.0, 1.0)))
+    median_V_z = float(np.median(v_vals))
+    cluster_size_vals = np.array([cluster_metrics[cid]['size'] for cid in valid_cluster_ids], dtype=float)
+    mean_cluster_size = float(np.mean(cluster_size_vals)) if len(cluster_size_vals) else 0.0
+    if config.split_size_gate_mode == "off":
+        split_min_size_effective = 1
+    elif config.split_size_gate_mode == "mean_ratio":
+        split_min_size_effective = max(
+            1,
+            int(np.ceil(mean_cluster_size * max(0.0, float(config.split_min_cluster_size_mean_ratio)))),
+        )
+    else:
+        split_min_size_effective = max(1, int(config.split_min_cluster_size))
     logging.info(
         "Using decision baseline L_baseline_assigned=%.4f (and log p(x) baseline=%.4f), Median V_z=%.4f. "
         "tune_operation=%s; enabled ops: split=%s merge=%s remove=%s revise=%s. "
         "remove: size<%s and L_z<%.4f. "
-        "split: size>=%s, min_conditions=%s over [L_z<%.4f, C_z<%.4f, gap_median>=%.4f], cooldown=%s. "
-        "merge: require cosine_sim>=%.2f AND min_conditions=%s over [cosine_sim, L_ratio<=%.3f, C_ratio<=%.3f]. "
+        "split: size_gate(mode=%s, effective_min=%s, mean_size=%.2f) AND "
+        "(L_z<=Q%.2f=%.4f OR C_z<=Q%.2f=%.4f OR V_z>=Q%.2f=%.4f), cooldown=%s. "
+        "merge: require cosine_sim>%.2f; epsilon mode=%s (base |L|<%.4f, |C|<%.4f). "
         "revise: min_conditions=%s over [L_z<%.4f, C_z<%.4f], cooldown=%s.",
         decision_baseline,
         baseline_log_px,
@@ -583,16 +618,20 @@ def decide_schema_updates(
         revise_enabled,
         config.remove_min_cluster_size,
         decision_baseline * config.remove_ll_factor,
-        config.split_min_cluster_size,
-        config.split_min_conditions,
-        decision_baseline - config.split_ll_margin,
-        config.split_confidence_max,
-        config.split_gap_median_min,
+        config.split_size_gate_mode,
+        split_min_size_effective,
+        mean_cluster_size,
+        config.split_l_bottom_quantile,
+        split_l_thresh,
+        config.split_c_bottom_quantile,
+        split_c_thresh,
+        config.split_v_top_quantile,
+        split_v_thresh,
         config.split_cooldown_iters,
         config.merge_similarity_min,
-        config.merge_min_conditions,
-        config.merge_l_diff_ratio_max,
-        config.merge_c_diff_ratio_max,
+        config.merge_epsilon_mode,
+        config.merge_l_abs_diff_max,
+        config.merge_c_abs_diff_max,
         config.revise_min_conditions,
         decision_baseline - config.revise_ll_margin,
         config.revise_confidence_max,
@@ -600,7 +639,9 @@ def decide_schema_updates(
     )
 
     # Track margins to understand how close we are to thresholds
-    split_margins = []
+    split_l_margins = []
+    split_c_margins = []
+    split_v_margins = []
     remove_margins = []
 
     # --- SPLIT & REMOVE ---
@@ -608,7 +649,8 @@ def decide_schema_updates(
         m = cluster_metrics[cid]
         # Per-cluster threshold diagnostics
         logging.info(
-            "Cluster %s ('%s'): L_z=%.4f, C_z=%.4f, V_z=%.4f, size=%s. remove_thresh=%.4f, split_thresh=%.4f",
+            "Cluster %s ('%s'): L_z=%.4f, C_z=%.4f, V_z=%.4f, size=%s. "
+            "remove_thresh=%.4f, split_size_min=%s, split_q_thresholds=[L<=%.4f, C<=%.4f, V>=%.4f]",
             cid,
             m.get('label', 'N/A'),
             m['L_z'],
@@ -616,14 +658,18 @@ def decide_schema_updates(
             m['V_z'],
             m['size'],
             decision_baseline * config.remove_ll_factor,
-            decision_baseline - config.split_ll_margin,
+            split_min_size_effective,
+            split_l_thresh,
+            split_c_thresh,
+            split_v_thresh,
         )
         # Removal Check
-        if (
+        remove_triggered = (
             remove_enabled
             and m['size'] < config.remove_min_cluster_size
             and m['L_z'] < decision_baseline * config.remove_ll_factor
-        ):
+        )
+        if remove_triggered:
             actions['remove'].append(cid)
             logging.info(
                 "  Suggest REMOVE for cluster %s ('%s'): size %s < %s AND L_z %.4f < baseline_thresh %.4f.",
@@ -634,33 +680,84 @@ def decide_schema_updates(
                 m['L_z'],
                 decision_baseline * config.remove_ll_factor,
             )
-            continue # If removed, don't consider for split
+            if not independent_operation_proposals:
+                continue # Legacy coupled mode: if removed, don't consider for split
         remove_margins.append(m['L_z'] - (decision_baseline * config.remove_ll_factor))
         # Split Check (gated)
         if split_enabled:
             cooldown_until = split_cooldown.get(cid)
             in_cooldown = cooldown_until is not None and iter_idx <= cooldown_until
             split_conditions = [
-                m['L_z'] < (decision_baseline - config.split_ll_margin),
-                m['C_z'] < config.split_confidence_max,
-                m.get('gap_median', 0.0) >= config.split_gap_median_min,
+                m['L_z'] <= split_l_thresh,
+                m['C_z'] <= split_c_thresh,
+                m['V_z'] >= split_v_thresh,
             ]
             if (
                 (not in_cooldown)
-                and m['size'] >= config.split_min_cluster_size
-                and int(sum(bool(x) for x in split_conditions)) >= max(1, int(config.split_min_conditions))
+                and m['size'] >= split_min_size_effective
+                and any(split_conditions)
             ):
+                passed_names = [
+                    name
+                    for name, cond in (
+                        ("L_bottom_quantile", split_conditions[0]),
+                        ("C_bottom_quantile", split_conditions[1]),
+                        ("V_top_quantile", split_conditions[2]),
+                    )
+                    if cond
+                ]
                 actions['split'].append(cid)
                 logging.info(
                     f"  Suggest SPLIT for cluster {cid} ('{m.get('label', 'N/A')}'): "
-                    f"passed {sum(bool(x) for x in split_conditions)}/{len(split_conditions)} split conditions."
+                    f"passed {sum(bool(x) for x in split_conditions)}/{len(split_conditions)} split conditions "
+                    f"{passed_names}."
                 )
-        split_margins.append(m['L_z'] - (decision_baseline - config.split_ll_margin))
+        split_l_margins.append(m['L_z'] - split_l_thresh)
+        split_c_margins.append(m['C_z'] - split_c_thresh)
+        split_v_margins.append(split_v_thresh - m['V_z'])
 
     # --- MERGE ---
     top_pairs = []
-    # Filter out clusters already marked for removal or split before considering for merge
-    eligible_for_merge_ids = [cid for cid in valid_cluster_ids if cid not in actions['remove'] and cid not in actions['split']]
+    # Legacy coupled mode filtered split/remove clusters out of merge candidacy.
+    # In independent proposal mode we keep merge candidacy independent of split/remove triggers.
+    if independent_operation_proposals:
+        eligible_for_merge_ids = list(valid_cluster_ids)
+    else:
+        eligible_for_merge_ids = [
+            cid
+            for cid in valid_cluster_ids
+            if cid not in actions['remove'] and cid not in actions['split']
+        ]
+    effective_merge_l_eps = float(config.merge_l_abs_diff_max)
+    effective_merge_c_eps = float(config.merge_c_abs_diff_max)
+    if config.merge_epsilon_mode == "quantile" and len(eligible_for_merge_ids) >= 2:
+        pair_diff_l: list[float] = []
+        pair_diff_c: list[float] = []
+        for i in range(len(eligible_for_merge_ids)):
+            for j in range(i + 1, len(eligible_for_merge_ids)):
+                m_i = cluster_metrics[eligible_for_merge_ids[i]]
+                m_j = cluster_metrics[eligible_for_merge_ids[j]]
+                pair_diff_l.append(abs(float(m_i['L_z']) - float(m_j['L_z'])))
+                pair_diff_c.append(abs(float(m_i['C_z']) - float(m_j['C_z'])))
+        if pair_diff_l:
+            effective_merge_l_eps = float(
+                np.quantile(
+                    np.array(pair_diff_l, dtype=float),
+                    np.clip(config.merge_l_abs_diff_quantile, 0.0, 1.0),
+                )
+            )
+            effective_merge_c_eps = float(
+                np.quantile(
+                    np.array(pair_diff_c, dtype=float),
+                    np.clip(config.merge_c_abs_diff_quantile, 0.0, 1.0),
+                )
+            )
+    logging.info(
+        "Effective merge epsilons: mode=%s => |L_a-L_b|<%.4f, |C_a-C_b|<%.4f",
+        config.merge_epsilon_mode,
+        effective_merge_l_eps,
+        effective_merge_c_eps,
+    )
     if not merge_enabled:
         logging.info("Merge operation disabled for this run.")
     elif len(eligible_for_merge_ids) < 2:
@@ -689,34 +786,26 @@ def decide_schema_updates(
                 m_j = cluster_metrics[id_j]
                 diff_L = abs(m_i['L_z'] - m_j['L_z'])
                 diff_C = abs(m_i['C_z'] - m_j['C_z'])
-                diff_L_ratio = diff_L / max(abs(m_i['L_z']), abs(m_j['L_z']), 1e-8)
-                diff_C_ratio = diff_C / max(m_i['C_z'], m_j['C_z'], 1e-8)
                 # Structural guardrail: similarity must pass for any merge.
-                if sim_val < config.merge_similarity_min:
+                if sim_val <= config.merge_similarity_min:
                     continue
-                merge_conditions = [
-                    sim_val >= config.merge_similarity_min,
-                    diff_L_ratio <= config.merge_l_diff_ratio_max,
-                    diff_C_ratio <= config.merge_c_diff_ratio_max,
-                ]
                 if (
-                    int(sum(bool(x) for x in merge_conditions)) >= max(1, int(config.merge_min_conditions))
+                    diff_L < effective_merge_l_eps
+                    and diff_C < effective_merge_c_eps
                 ):
                     actions['merge'].append(tuple(sorted((id_i, id_j)))) # Store sorted tuple to avoid duplicates like (B,A) if (A,B) decided
                     merged_already.add(id_i)
                     merged_already.add(id_j)
                     logging.info(
                         "  Suggest MERGE for clusters %s ('%s') and %s ('%s'): "
-                        "passed %s/%s merge conditions (sim=%.4f, L_diff_ratio=%.4f, C_diff_ratio=%.4f).",
+                        "passed mentor thresholds (sim=%.4f, L_diff=%.4f, C_diff=%.4f).",
                         id_i,
                         m_i.get('label', 'N/A'),
                         id_j,
                         m_j.get('label', 'N/A'),
-                        sum(bool(x) for x in merge_conditions),
-                        len(merge_conditions),
                         sim_val,
-                        diff_L_ratio,
-                        diff_C_ratio,
+                        diff_L,
+                        diff_C,
                     )
                     break # Merge id_i with one cluster, then move to next i
     
@@ -761,9 +850,27 @@ def decide_schema_updates(
         if remove_margins:
             logging.info(f"Remove margin (L_z - remove_thresh) min/median/max: "
                          f"{np.min(remove_margins):.4f}/{np.median(remove_margins):.4f}/{np.max(remove_margins):.4f}")
-        if split_margins:
-            logging.info(f"Split margin (L_z - split_thresh) min/median/max: "
-                         f"{np.min(split_margins):.4f}/{np.median(split_margins):.4f}/{np.max(split_margins):.4f}")
+        if split_l_margins:
+            logging.info(
+                "Split L margin (L_z - L_q_thresh) min/median/max: %.4f/%.4f/%.4f",
+                float(np.min(split_l_margins)),
+                float(np.median(split_l_margins)),
+                float(np.max(split_l_margins)),
+            )
+        if split_c_margins:
+            logging.info(
+                "Split C margin (C_z - C_q_thresh) min/median/max: %.4f/%.4f/%.4f",
+                float(np.min(split_c_margins)),
+                float(np.median(split_c_margins)),
+                float(np.max(split_c_margins)),
+            )
+        if split_v_margins:
+            logging.info(
+                "Split V margin (V_q_thresh - V_z) min/median/max: %.4f/%.4f/%.4f",
+                float(np.min(split_v_margins)),
+                float(np.median(split_v_margins)),
+                float(np.max(split_v_margins)),
+            )
     if log_top_pairs > 0 and top_pairs:
         top_pairs.sort(reverse=True, key=lambda x: x[0])
         logging.info(f"Top-{log_top_pairs} merge candidate similarities:")
@@ -874,6 +981,28 @@ def _collect_existing_cluster_labels(
             continue
         labels.append(str(lbl))
     return labels
+
+
+def _has_numeric_token(label: str | None) -> bool:
+    s = sanitize_text(label or "")
+    return bool(re.search(r"\b\d+\b", s))
+
+
+def _is_structural_placeholder_label(label: str | None) -> bool:
+    """
+    Detect labels used for structural-only scoring, e.g.:
+      - "<X> Parent Z100"
+      - "<X> Child Z100"
+      - "<X> Merged Z100"
+    """
+    s = sanitize_text(label or "").lower()
+    if not s:
+        return False
+    if re.search(r"\b(parent|child|merged)\b", s):
+        return True
+    if re.search(r"\bz\d+\b", s):
+        return True
+    return False
 
 
 def _build_parent_relative_split_labels(
@@ -1572,9 +1701,20 @@ def em_schema_refinement(
             f"Invalid structural_label_mode '{config.structural_label_mode}'. "
             f"Expected one of {VALID_STRUCTURAL_LABEL_MODES}."
         )
+    if config.split_size_gate_mode not in VALID_SPLIT_SIZE_GATE_MODES:
+        raise ValueError(
+            f"Invalid split_size_gate_mode '{config.split_size_gate_mode}'. "
+            f"Expected one of {VALID_SPLIT_SIZE_GATE_MODES}."
+        )
+    if config.merge_epsilon_mode not in VALID_MERGE_EPSILON_MODES:
+        raise ValueError(
+            f"Invalid merge_epsilon_mode '{config.merge_epsilon_mode}'. "
+            f"Expected one of {VALID_MERGE_EPSILON_MODES}."
+        )
     logging.info(
         "Operation config: tune_operation=%s | split=%s merge=%s remove=%s add=%s revise=%s | "
-        "best_operation_per_iteration=%s max_same_operation_streak=%s | structural_label_mode=%s split_label_pair_attempts=%s llm_label_max_attempts=%s",
+        "best_operation_per_iteration=%s max_same_operation_streak=%s | structural_label_mode=%s "
+        "split_size_gate_mode=%s merge_epsilon_mode=%s split_label_pair_attempts=%s llm_label_max_attempts=%s",
         config.tune_operation,
         config.operation_enabled("split"),
         config.operation_enabled("merge"),
@@ -1584,6 +1724,8 @@ def em_schema_refinement(
         config.best_operation_per_iteration,
         config.max_same_operation_streak,
         config.structural_label_mode,
+        config.split_size_gate_mode,
+        config.merge_epsilon_mode,
         config.split_label_pair_attempts,
         config.llm_label_max_attempts,
     )
@@ -2417,6 +2559,225 @@ def em_schema_refinement(
                 exc,
             )
             return None
+
+    def _semantic_relabel_structural_placeholders(
+        df_in: pd.DataFrame,
+        *,
+        iter_number: int,
+        context_prefix: str,
+        base_calibrator: ProbabilityCalibrator,
+    ) -> tuple[pd.DataFrame, int]:
+        """
+        After a structural change is accepted under parent_relative mode,
+        relabel any remaining placeholder labels into semantic, human-readable labels.
+        """
+        if config.structural_label_mode != "parent_relative":
+            return df_in, 0
+        if df_in.empty:
+            return df_in, 0
+        if "cluster_id" not in df_in.columns or "agglomerative_label" not in df_in.columns:
+            return df_in, 0
+
+        cluster_label_map = (
+            df_in.groupby("cluster_id")["agglomerative_label"].first().astype(str).to_dict()
+        )
+        target_cluster_ids = [
+            int(cid)
+            for cid, lbl in cluster_label_map.items()
+            if _is_structural_placeholder_label(lbl)
+        ]
+        if not target_cluster_ids:
+            return df_in, 0
+
+        logging.info(
+            "[Iter %s] Post-accept semantic relabel pass: %s placeholder clusters detected.",
+            iter_number,
+            len(target_cluster_ids),
+        )
+        out_df = df_in.copy()
+        shared_vllm_tokenizer = getattr(base_calibrator, "vllm_tokenizer", None)
+        shared_vllm_model = getattr(base_calibrator, "vllm_model", None)
+
+        occupied_labels = [
+            str(lbl)
+            for cid, lbl in cluster_label_map.items()
+            if int(cid) not in set(target_cluster_ids)
+        ]
+        occupied_keys = {
+            _canonical_label_key(lbl)
+            for lbl in occupied_labels
+            if _canonical_label_key(lbl)
+        }
+        changed = 0
+
+        for cid in sorted(target_cluster_ids):
+            if cid not in set(out_df["cluster_id"].unique()):
+                continue
+
+            current_label = str(
+                out_df.loc[out_df["cluster_id"] == cid, "agglomerative_label"].iloc[0]
+            )
+            texts = out_df.loc[out_df["cluster_id"] == cid, text_column_name].astype(str).tolist()
+            samples = _sample_texts_for_labeling(texts, max_texts=12, seed=int(cid))
+            banned_names = list(occupied_labels) + [current_label]
+
+            new_label = None
+            for pair_try in range(1, max(1, int(config.split_label_pair_attempts)) + 1):
+                candidate_label = None
+                if model_type == "vllm":
+                    llm_label = _label_cluster_vllm(
+                        samples,
+                        model_identifier,
+                        tokenizer=shared_vllm_tokenizer,
+                        model=shared_vllm_model,
+                        parent_label=base_label(current_label),
+                        banned_names=banned_names,
+                        context=f"{context_prefix}:semantic_relabel:{cid}:pass{pair_try}",
+                        max_attempts=config.llm_label_max_attempts,
+                    )
+                    if llm_label:
+                        name, _, keywords = llm_label
+                        candidate_label = build_label_string(name, keywords)
+
+                if not candidate_label:
+                    candidate_label = _fallback_distinct_label_from_texts(
+                        samples,
+                        banned_names=banned_names,
+                    )
+                if not candidate_label:
+                    name, keywords = propose_label_and_keywords_from_texts(
+                        samples,
+                        parent_label=base_label(current_label),
+                    )
+                    candidate_label = build_label_string(name, keywords)
+
+                cand_key = _canonical_label_key(candidate_label)
+                invalid = (
+                    not candidate_label
+                    or not cand_key
+                    or cand_key in occupied_keys
+                    or _is_structural_placeholder_label(candidate_label)
+                    or _has_numeric_token(candidate_label)
+                )
+                if invalid:
+                    if candidate_label:
+                        banned_names.append(candidate_label)
+                    continue
+
+                dup_with_existing = False
+                if occupied_labels:
+                    dup_pairs = detect_near_duplicate_labels(
+                        [candidate_label] + occupied_labels,
+                        threshold=DUP_LABEL_SIM_THRESHOLD,
+                    )
+                    dup_with_existing = any(0 in pair for pair in dup_pairs)
+                if dup_with_existing:
+                    banned_names.append(candidate_label)
+                    continue
+
+                new_label = candidate_label
+                break
+
+            if not new_label:
+                # Final deterministic semantic fallback (no explicit IDs/parent-child tokens).
+                fallback_pool = [
+                    "Narrative Context",
+                    "Event Description",
+                    "Descriptive Details",
+                    "Background Narrative",
+                    "Contextual Information",
+                    "Temporal Context",
+                    "Relational Context",
+                ]
+                for base_name in fallback_pool:
+                    candidate_label = build_label_string(base_name)
+                    cand_key = _canonical_label_key(candidate_label)
+                    if (
+                        cand_key
+                        and cand_key not in occupied_keys
+                        and not _is_structural_placeholder_label(candidate_label)
+                        and not _has_numeric_token(candidate_label)
+                    ):
+                        new_label = candidate_label
+                        break
+
+            if not new_label:
+                logging.warning(
+                    "[Iter %s] Could not derive semantic relabel for cluster %s; keeping placeholder '%s'.",
+                    iter_number,
+                    cid,
+                    current_label,
+                )
+                continue
+
+            out_df.loc[out_df["cluster_id"] == cid, "agglomerative_label"] = new_label
+            if _canonical_label_key(current_label) != _canonical_label_key(new_label):
+                changed += 1
+            logging.info(
+                "[Iter %s] Post-accept relabel: cluster %s '%s' -> '%s'",
+                iter_number,
+                cid,
+                current_label,
+                new_label,
+            )
+            occupied_labels.append(new_label)
+            occupied_keys.add(_canonical_label_key(new_label))
+
+        if changed > 0:
+            changed += _rename_duplicate_labels(out_df, text_column_name)
+            labels_by_cluster = (
+                out_df.groupby("cluster_id")["agglomerative_label"].first().astype(str).to_dict()
+            )
+            used_keys: set[str] = set()
+            remap: dict[int, str] = {}
+            forced_unique_alpha = 0
+
+            def _alpha_suffix(n: int) -> str:
+                # 0->A, 1->B, ..., 25->Z, 26->AA, ...
+                n = int(n)
+                out = []
+                while True:
+                    out.append(chr(ord("A") + (n % 26)))
+                    n = n // 26 - 1
+                    if n < 0:
+                        break
+                return "".join(reversed(out))
+
+            for cid in sorted(labels_by_cluster.keys()):
+                label_now = build_label_string(labels_by_cluster[cid])
+                key_now = _canonical_label_key(label_now)
+                invalid = (
+                    not key_now
+                    or key_now in used_keys
+                    or _is_structural_placeholder_label(label_now)
+                    or _has_numeric_token(label_now)
+                )
+                if invalid:
+                    base = base_label(label_now) or "Refined Theme"
+                    suffix_idx = 0
+                    while True:
+                        candidate = build_label_string(f"{base} {_alpha_suffix(suffix_idx)}")
+                        cand_key = _canonical_label_key(candidate)
+                        if (
+                            cand_key
+                            and cand_key not in used_keys
+                            and not _is_structural_placeholder_label(candidate)
+                            and not _has_numeric_token(candidate)
+                        ):
+                            label_now = candidate
+                            key_now = cand_key
+                            break
+                        suffix_idx += 1
+                    forced_unique_alpha += 1
+                remap[int(cid)] = label_now
+                used_keys.add(key_now)
+
+            if forced_unique_alpha > 0:
+                out_df["agglomerative_label"] = out_df["cluster_id"].map(remap)
+                changed += forced_unique_alpha
+
+        return out_df, changed
+
     for iter_idx in range(max_iters):
         logging.info(f"=== EM Iteration {iter_idx + 1}/{max_iters} ===")
         iteration_actions = {}
@@ -2493,6 +2854,9 @@ def em_schema_refinement(
             split_cooldown,
             revise_cooldown,
             iter_idx + 1,
+            independent_operation_proposals=bool(
+                config.best_operation_per_iteration and config.tune_operation == "all"
+            ),
             verbose=verbose,
             log_top_pairs=log_top_pairs,
         )
@@ -2503,6 +2867,7 @@ def em_schema_refinement(
                 if accepted_avg_logL_per_token_by_variant.get(config.accept_metric) is not None
                 else pre_corpus_scores_iter[f"avg_logL_per_token_{config.accept_metric}"]
             )
+            accept_metric_key = f"avg_logL_per_token_{config.accept_metric}"
             logging.info(
                 "[Iter %s] Threshold-passing structural actions: split=%s merge=%s remove=%s",
                 iter_idx + 1,
@@ -2623,6 +2988,62 @@ def em_schema_refinement(
                 iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
                 iteration_actions["metric_delta_accept_metric"] = metric_delta
                 iteration_actions["accept_metric"] = config.accept_metric
+
+                semantic_relabel_changed = 0
+                if config.structural_label_mode == "parent_relative":
+                    current_merged_df, semantic_relabel_changed = _semantic_relabel_structural_placeholders(
+                        current_merged_df,
+                        iter_number=iter_idx + 1,
+                        context_prefix=f"iter{iter_idx + 1}:candidate_accept",
+                        base_calibrator=current_prob_calibrator,
+                    )
+                    if semantic_relabel_changed > 0:
+                        schema_state = build_schema_state_from_df(current_merged_df)
+                        current_merged_df["agglomerative_label"] = current_merged_df["cluster_id"].map(
+                            schema_state.label_map
+                        )
+                        current_choices_list = list(schema_state.choices_list)
+                        if list(current_prob_calibrator.choices) != list(current_choices_list):
+                            try:
+                                current_prob_calibrator = rebuild_calibrator_with_existing_backend(
+                                    current_prob_calibrator,
+                                    current_choices_list,
+                                    verbose=verbose,
+                                )
+                            except Exception:
+                                current_prob_calibrator = initialize_probability_calibrator(
+                                    model_identifier=model_identifier,
+                                    model_type=model_type,
+                                    choices=current_choices_list,
+                                    num_trials=current_prob_calibrator.num_trials,
+                                    scorer_type="batch" if current_prob_calibrator.batch_prompts is False else "single",
+                                    verbose=verbose,
+                                )
+                        token_count_tokenizer = (
+                            getattr(current_prob_calibrator, "tokenizer", None)
+                            or getattr(current_prob_calibrator, "vllm_tokenizer", None)
+                            or token_count_tokenizer
+                        )
+                        if schema_state.p_z_prior is not None:
+                            current_prob_calibrator.p_z = schema_state.p_z_prior
+                        post_doc_scores_iter, _, post_corpus_scores_iter = _compute_variant_metrics(
+                            current_merged_df,
+                            schema_state,
+                        )
+                        metric_delta = float(
+                            post_corpus_scores_iter[accept_metric_key] - baseline_accept_metric_value
+                        )
+                        iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                        iteration_actions["metric_delta_accept_metric"] = metric_delta
+                        logging.info(
+                            "[Iter %s] Post-accept semantic relabel changed %s cluster labels; recomputed delta_vs_best_%s=%.6f.",
+                            iter_idx + 1,
+                            semantic_relabel_changed,
+                            config.accept_metric,
+                            metric_delta,
+                        )
+                if semantic_relabel_changed > 0:
+                    iteration_actions["post_accept_semantic_relabels"] = int(semantic_relabel_changed)
 
                 for variant in VALID_ACCEPT_METRICS:
                     accepted_avg_logL_per_token_by_variant[variant] = float(
@@ -3364,6 +3785,11 @@ def em_schema_refinement(
         accepted_update = True
         metric_delta = np.nan
         accept_metric_key = f"avg_logL_per_token_{config.accept_metric}"
+        baseline_accept_metric_value = float(
+            accepted_avg_logL_per_token_by_variant.get(config.accept_metric)
+            if accepted_avg_logL_per_token_by_variant.get(config.accept_metric) is not None
+            else pre_corpus_scores_iter[accept_metric_key]
+        )
         if (
             config.rollback_on_metric_degrade
             and post_corpus_scores_iter is not None
@@ -3458,6 +3884,69 @@ def em_schema_refinement(
                 no_op_iters += 1
             else:
                 no_op_iters = 0
+
+        if (
+            bool(iteration_actions.get("accepted", True))
+            and proposed_action_count > 0
+            and config.structural_label_mode == "parent_relative"
+        ):
+            current_merged_df, semantic_relabel_changed = _semantic_relabel_structural_placeholders(
+                current_merged_df,
+                iter_number=iter_idx + 1,
+                context_prefix=f"iter{iter_idx + 1}:accepted_update",
+                base_calibrator=current_prob_calibrator,
+            )
+            if semantic_relabel_changed > 0:
+                schema_state = build_schema_state_from_df(current_merged_df)
+                current_merged_df["agglomerative_label"] = current_merged_df["cluster_id"].map(
+                    schema_state.label_map
+                )
+                current_choices_list = list(schema_state.choices_list)
+                if list(current_prob_calibrator.choices) != list(current_choices_list):
+                    try:
+                        current_prob_calibrator = rebuild_calibrator_with_existing_backend(
+                            current_prob_calibrator,
+                            current_choices_list,
+                            verbose=verbose,
+                        )
+                    except Exception:
+                        current_prob_calibrator = initialize_probability_calibrator(
+                            model_identifier=model_identifier,
+                            model_type=model_type,
+                            choices=current_choices_list,
+                            num_trials=current_prob_calibrator.num_trials,
+                            scorer_type="batch" if current_prob_calibrator.batch_prompts is False else "single",
+                            verbose=verbose,
+                        )
+                token_count_tokenizer = (
+                    getattr(current_prob_calibrator, "tokenizer", None)
+                    or getattr(current_prob_calibrator, "vllm_tokenizer", None)
+                    or token_count_tokenizer
+                )
+                if schema_state.p_z_prior is not None:
+                    current_prob_calibrator.p_z = schema_state.p_z_prior
+                post_doc_scores_iter, _, post_corpus_scores_iter = _compute_variant_metrics(
+                    current_merged_df,
+                    schema_state,
+                )
+                metric_delta = float(
+                    post_corpus_scores_iter[accept_metric_key] - baseline_accept_metric_value
+                )
+                iteration_actions["metric_delta_avg_logL_tok"] = metric_delta
+                iteration_actions["metric_delta_accept_metric"] = metric_delta
+                iteration_actions["post_accept_semantic_relabels"] = int(semantic_relabel_changed)
+                unique_cluster_ids_after_iter = sorted(current_merged_df["cluster_id"].unique())
+                logging.info(
+                    "[Iter %s] Post-accept semantic relabel changed %s cluster labels; recomputed delta_vs_best_%s=%.6f.",
+                    iter_idx + 1,
+                    semantic_relabel_changed,
+                    config.accept_metric,
+                    metric_delta,
+                )
+                for variant in VALID_ACCEPT_METRICS:
+                    accepted_avg_logL_per_token_by_variant[variant] = float(
+                        post_corpus_scores_iter[f"avg_logL_per_token_{variant}"]
+                    )
 
         if config.best_operation_per_iteration and config.tune_operation == "all":
             applied_op = iteration_actions.get("selected_operation")
@@ -3670,7 +4159,15 @@ def main(args):
     # 1. Construct paths
     experiment_base_dir = Path(args.experiment_dir)
     models_dir = experiment_base_dir / "models"
-    agglomerative_output_dir = resolve_agglomerative_output_dir(experiment_base_dir)
+    if args.agglomerative_output_dir:
+        agglomerative_output_dir = Path(args.agglomerative_output_dir)
+        if not agglomerative_output_dir.is_absolute():
+            agglomerative_output_dir = experiment_base_dir / agglomerative_output_dir
+        if not agglomerative_output_dir.exists():
+            raise FileNotFoundError(f"Specified agglomerative output dir not found: {agglomerative_output_dir}")
+        logging.info("Using user-specified agglomerative output dir: %s", agglomerative_output_dir)
+    else:
+        agglomerative_output_dir = resolve_agglomerative_output_dir(experiment_base_dir)
     if args.sentence_data_path:
         sentence_data_path = Path(args.sentence_data_path)
     else:
@@ -3730,6 +4227,11 @@ def main(args):
             split_enabled=args.split_enabled,
             split_max_per_iter=args.split_max_per_iter,
             split_min_cluster_size=args.split_min_cluster_size,
+            split_size_gate_mode=args.split_size_gate_mode,
+            split_min_cluster_size_mean_ratio=args.split_min_cluster_size_mean_ratio,
+            split_l_bottom_quantile=args.split_l_bottom_quantile,
+            split_c_bottom_quantile=args.split_c_bottom_quantile,
+            split_v_top_quantile=args.split_v_top_quantile,
             split_ll_margin=args.split_ll_margin,
             split_confidence_max=args.split_confidence_max,
             split_gap_median_min=args.split_gap_median_min,
@@ -3738,6 +4240,11 @@ def main(args):
             merge_enabled=args.merge_enabled,
             merge_max_per_iter=args.merge_max_per_iter,
             merge_similarity_min=args.merge_similarity_min,
+            merge_epsilon_mode=args.merge_epsilon_mode,
+            merge_l_abs_diff_quantile=args.merge_l_abs_diff_quantile,
+            merge_c_abs_diff_quantile=args.merge_c_abs_diff_quantile,
+            merge_l_abs_diff_max=args.merge_l_abs_diff_max,
+            merge_c_abs_diff_max=args.merge_c_abs_diff_max,
             merge_l_diff_ratio_max=args.merge_l_diff_ratio_max,
             merge_c_diff_ratio_max=args.merge_c_diff_ratio_max,
             merge_min_conditions=args.merge_min_conditions,
@@ -3827,6 +4334,16 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reads agglomerative clustering outputs, scores sentences using ProbabilityCalibrator.")
     parser.add_argument("--experiment_dir", type=str, required=True, help="Path to the experiment directory (e.g., experiments/editorial).")
+    parser.add_argument(
+        "--agglomerative_output_dir",
+        type=str,
+        default=None,
+        help=(
+            "Override hierarchy directory containing inner_node_labels.csv and clusters_level_*_clusters.csv. "
+            "If relative, it is resolved under --experiment_dir. "
+            "Default auto-discovers hierarchy_results, then hierarchy_results__standard, then hierarchy_results__*."
+        ),
+    )
     parser.add_argument("--output_file", type=str, required=True, help="Path to save the output CSV file.")
     
     group = parser.add_mutually_exclusive_group(required=True)
@@ -3897,10 +4414,26 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split_max_per_iter", type=int, default=1)
     parser.add_argument("--split_min_cluster_size", type=int, default=20)
+    parser.add_argument(
+        "--split_size_gate_mode",
+        type=str,
+        choices=list(VALID_SPLIT_SIZE_GATE_MODES),
+        default="fixed",
+        help="Split size gate mode: fixed, mean_ratio, or off.",
+    )
+    parser.add_argument(
+        "--split_min_cluster_size_mean_ratio",
+        type=float,
+        default=0.50,
+        help="When split_size_gate_mode=mean_ratio, effective split min size is ceil(mean_cluster_size * this_ratio).",
+    )
+    parser.add_argument("--split_l_bottom_quantile", type=float, default=0.25, help="Bottom quantile threshold for L_z split trigger.")
+    parser.add_argument("--split_c_bottom_quantile", type=float, default=0.25, help="Bottom quantile threshold for C_z split trigger.")
+    parser.add_argument("--split_v_top_quantile", type=float, default=0.75, help="Top quantile threshold for V_z split trigger.")
     parser.add_argument("--split_ll_margin", type=float, default=6.0)
     parser.add_argument("--split_confidence_max", type=float, default=0.30)
     parser.add_argument("--split_gap_median_min", type=float, default=0.10)
-    parser.add_argument("--split_min_conditions", type=int, default=1, help="Min number of split conditions that must pass (L_z/C_z/gap) once base gates pass.")
+    parser.add_argument("--split_min_conditions", type=int, default=1, help="Deprecated for mentor quartile split logic; retained for backward compatibility.")
     parser.add_argument("--split_cooldown_iters", type=int, default=1)
 
     # Merge config
@@ -3912,9 +4445,30 @@ if __name__ == "__main__":
     )
     parser.add_argument("--merge_max_per_iter", type=int, default=1)
     parser.add_argument("--merge_similarity_min", type=float, default=0.80)
+    parser.add_argument(
+        "--merge_epsilon_mode",
+        type=str,
+        choices=list(VALID_MERGE_EPSILON_MODES),
+        default="fixed",
+        help="Merge epsilon mode: fixed or quantile.",
+    )
+    parser.add_argument(
+        "--merge_l_abs_diff_quantile",
+        type=float,
+        default=0.25,
+        help="When merge_epsilon_mode=quantile, epsilon_L is this quantile of pairwise |L_a-L_b| among eligible merge pairs.",
+    )
+    parser.add_argument(
+        "--merge_c_abs_diff_quantile",
+        type=float,
+        default=0.25,
+        help="When merge_epsilon_mode=quantile, epsilon_C is this quantile of pairwise |C_a-C_b| among eligible merge pairs.",
+    )
+    parser.add_argument("--merge_l_abs_diff_max", type=float, default=12.0, help="Absolute epsilon_L threshold for merge: |L_a-L_b| <= epsilon_L.")
+    parser.add_argument("--merge_c_abs_diff_max", type=float, default=0.10, help="Absolute epsilon_C threshold for merge: |C_a-C_b| <= epsilon_C.")
     parser.add_argument("--merge_l_diff_ratio_max", type=float, default=0.10)
     parser.add_argument("--merge_c_diff_ratio_max", type=float, default=0.10)
-    parser.add_argument("--merge_min_conditions", type=int, default=1, help="Min number of merge conditions that must pass (similarity/L_ratio/C_ratio).")
+    parser.add_argument("--merge_min_conditions", type=int, default=1, help="Deprecated for mentor merge logic; retained for backward compatibility.")
 
     # Remove config
     parser.add_argument(

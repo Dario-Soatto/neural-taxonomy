@@ -390,6 +390,11 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
         
     # Default sampling parameters for logprobs
     sampling_params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0)
+    try:
+        choice_batch_size_default = int(os.environ.get("VLLM_CHOICE_BATCH_SIZE", "4"))
+    except Exception:
+        choice_batch_size_default = 4
+    choice_batch_size_default = max(1, choice_batch_size_default)
     
     def choice_log_prob_sums_single(prompt, choices):
         """Get log probability sums for each choice when appended to the prompt."""
@@ -429,7 +434,7 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
         return results
     
     # vLLM batch function
-    def choice_log_prob_sums_batch(prompts, choices, batch_size=16):
+    def choice_log_prob_sums_batch(prompts, choices, batch_size=None):
         """Get log probability sums for each choice with batch processing.
         
         Args:
@@ -441,6 +446,10 @@ def build_vllm_logprob_fns(model_name_or_path, tokenizer=None, device_map='auto'
         Returns:
             List of log probability sums (one per choice).
         """
+        if batch_size is None:
+            batch_size = choice_batch_size_default
+        batch_size = max(1, int(batch_size))
+
         if not choices:
             return []
         
