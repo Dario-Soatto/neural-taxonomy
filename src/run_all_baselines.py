@@ -144,7 +144,7 @@ def run_lda_gibbs(texts: list, n_topics: int, random_state: int = 42,
     for text in texts:
         mdl.add_doc(str(text).split())
     mdl.burn_in = 100
-    mdl.train(iter=n_iters)
+    mdl.train(iterations=n_iters)
 
     # Get document-topic distributions
     doc_topic_dist = np.array([mdl.docs[i].get_topic_dist() for i in range(len(mdl.docs))])
@@ -216,7 +216,7 @@ def run_seeded_lda(texts: list, n_topics: int, random_state: int = 42,
     for text in texts:
         mdl.add_doc(str(text).split())
     mdl.burn_in = 100
-    mdl.train(iter=n_iters)
+    mdl.train(iterations=n_iters)
 
     doc_topic_dist = np.array([mdl.docs[i].get_topic_dist() for i in range(len(mdl.docs))])
     clusters = doc_topic_dist.argmax(axis=1)
