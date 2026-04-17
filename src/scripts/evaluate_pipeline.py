@@ -40,8 +40,20 @@ def main():
     args = parser.parse_args()
 
     experiment_dir = Path(args.experiment_dir)
-    hierarchy_dir = experiment_dir / "hierarchy_results"
     models_dir = experiment_dir / "models"
+
+    # Step 6 appends a variant suffix (e.g. __standard) to the output dir.
+    # Find the actual hierarchy results directory.
+    hierarchy_dir = experiment_dir / "hierarchy_results"
+    if not hierarchy_dir.exists():
+        candidates = sorted(experiment_dir.glob("hierarchy_results__*"))
+        if candidates:
+            hierarchy_dir = candidates[-1]
+            logging.info("Using hierarchy dir: %s", hierarchy_dir)
+        else:
+            raise FileNotFoundError(
+                f"No hierarchy_results directory found in {experiment_dir}"
+            )
 
     # Load ground truth
     raw_df = pd.read_csv(args.raw_data_csv)
