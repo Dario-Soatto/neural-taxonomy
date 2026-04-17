@@ -208,6 +208,24 @@ def robust_parse_outputs(output):
                     return {"label": label_match.group(1), "description": desc_match.group(1)}
             except Exception:
                 pass
+            # Handle markdown-style output (e.g. **Keyword Label:** value)
+            try:
+                raw = output if output else ""
+                label_match = re.search(
+                    r'\*{0,2}(?:Keyword\s+)?Label[:\s*]*\*{0,2}\s*(.+)',
+                    raw, re.IGNORECASE,
+                )
+                desc_match = re.search(
+                    r'\*{0,2}Description[:\s*]*\*{0,2}\s*(.+)',
+                    raw, re.IGNORECASE,
+                )
+                if label_match and desc_match:
+                    return {
+                        "label": label_match.group(1).strip(),
+                        "description": desc_match.group(1).strip(),
+                    }
+            except Exception:
+                pass
             return None
 
 
