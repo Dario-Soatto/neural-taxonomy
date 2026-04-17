@@ -17,6 +17,9 @@
 #   - Preflight: numpy/faiss ABI, accelerate, more-itertools, datasets
 #   - Skip completed steps when outputs already exist (safe resume)
 #   - Logs in repo root (no logs/ dir required before sbatch)
+#   - Step 6 writes to hierarchy_results__standard/ (suffix from step_6). Step 7 uses
+#     evaluate_pipeline.py which must be recent enough to resolve that dir (do not rely
+#     on an empty hierarchy_results/ shadowing the variant folder — we do not mkdir it).
 #
 # Usage:
 #   cd /path/to/neural-taxonomy && sbatch src/sbatch/run_bbc_news_consolidated.sh
@@ -65,7 +68,7 @@ mkdir -p "${LOCAL_SCRATCH}/hf_cache/hub" "${LOCAL_SCRATCH}/cache/vllm"
 
 export HF_HOME="${LOCAL_SCRATCH}/hf_cache"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
-export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+# TRANSFORMERS_CACHE omitted (deprecated); HF_HOME + hub cache are enough for current Transformers.
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 export XDG_CACHE_HOME="${LOCAL_SCRATCH}/cache"
 export TORCH_HOME="${LOCAL_SCRATCH}/cache/torch"
@@ -246,7 +249,6 @@ if [[ -f "${STEP6_THRESH}" ]]; then
   echo ">>> Step 6: SKIP (found ${STEP6_THRESH})"
 else
   echo ">>> Step 6: Agglomerative clustering…"
-  mkdir -p "${EXPERIMENT_DIR}/hierarchy_results"
   python src/step_6__agglomerative_clustering.py \
     "${EXPERIMENT_DIR}/models/cluster_centroids.npy" \
     "${EXPERIMENT_DIR}/hierarchy_results" \
