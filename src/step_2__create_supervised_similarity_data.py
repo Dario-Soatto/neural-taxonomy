@@ -695,6 +695,13 @@ def main():
         logging.info(f"Creating output directory: {output_path}")
         os.makedirs(output_path)
     
+    if full_data_exp_df.empty or 'label' not in full_data_exp_df.columns:
+        logging.error(
+            "No labeled pairs available after LLM matching; aborting. "
+            "Fix prompts / model outputs and re-run step 2 (downstream steps need triplets)."
+        )
+        sys.exit(1)
+
     output_filename = f'paired_labeled_data_{output_fname}.csv'
     paired_labeled_data_path = os.path.join(output_path, output_filename)
     logging.info(f"Saving paired labeled data to: {paired_labeled_data_path}")
@@ -702,9 +709,6 @@ def main():
 
     # Step 3: Create triplets and save to file
     # ----------------------------------------------------------------
-    if full_data_exp_df.empty or 'label' not in full_data_exp_df.columns:
-        logging.error("No labeled pairs available; skipping triplet creation.")
-        return
     logging.info("Creating triplets from labeled data")
     triplets = create_triplets(full_data_exp_df)
     output_filename = f'triplets_{output_fname}.jsonl'
@@ -769,7 +773,6 @@ def _parse_similarity_pairs_final(raw_text):
     
     # 2. YOUR REGEX: Triple quoted to handle single quotes safely
     pattern = r"""pair_idx["']?\s*:\s*(\d+).*?label["']?\s*:\s*["']?([Yy]es|[Nn]o)["']?"""
-    print(f"[DEBUG]: Using regex {pattern}")
 
     for match in re.finditer(pattern, raw_text, re.DOTALL | re.IGNORECASE):
         pairs.append({
