@@ -875,6 +875,12 @@ def custom_examples_loader(
                 .assign(key=lambda df: df.apply(lambda x: x['custom_id'].split('__')[x['sentence_idx'] - 1], axis=1))
         )
         return data_level_labels_df.merge(examples_df.drop_duplicates(subset='key'), on='key'), text_embeddings
+
+    elif experiment == 'bbc-news':
+        if 'sentences' not in data_level_labels_df.columns and 'description' in data_level_labels_df.columns:
+            data_level_labels_df = data_level_labels_df.rename(columns={'description': 'sentences'})
+        return data_level_labels_df, text_embeddings
+
     else:
         raise ValueError(f"Experiment {experiment} not supported")
 

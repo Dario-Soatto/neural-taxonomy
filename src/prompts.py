@@ -354,6 +354,24 @@ class EditorialLabelingResponse(BaseModel):
     description: str
 
 
+# ── BBC News / generic topic labeling ────────────────────────────────────────
+
+BBC_NEWS_LABELING_PROMPT = """You will be given a news article. Read the article and generate a short keyword label \
+describing the article's main topic, along with a one-sentence description of what the article is about.
+
+<article>
+{article}
+</article>
+
+Your response:
+"""
+
+class BBCNewsLabelingResponse(BaseModel):
+    """Response format for BBC News topic labeling (single label per article)."""
+    label: str
+    description: str
+
+
 class MultiSentenceLabelingItem(BaseModel):
     """Individual sentence labeling in multi-sentence response."""
     sentence_idx: int

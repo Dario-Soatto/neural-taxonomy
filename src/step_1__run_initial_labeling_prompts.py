@@ -51,6 +51,9 @@ from prompts import (
     NEWS_DISCOURSE_LABELING_PROMPT,
     NewsDiscourseLabelingResponse,
     MultiNewsDiscourseLabelingResponse,
+    #
+    BBC_NEWS_LABELING_PROMPT,
+    BBCNewsLabelingResponse,
 )
 
 # Import VLLM only if needed
@@ -313,6 +316,22 @@ def make_labeling_prompts_hate_speech(input_df, multi_sentence=False, num_sents_
         return prompt_df
 
 
+def make_labeling_prompts_bbc_news(input_df):
+    """BBC News: one article per row, flat {label, description} response."""
+    prompts = []
+    for _, row in input_df.iterrows():
+        prompts.append({
+            'index': str(row['id']),
+            'article': row['text'],
+        })
+    prompt_df = pd.DataFrame(prompts)
+    prompt_df['prompt'] = prompt_df['article'].apply(
+        lambda x: BBC_NEWS_LABELING_PROMPT.format(article=x)
+    )
+    prompt_df['response_format'] = BBCNewsLabelingResponse
+    return prompt_df
+
+
 def _truncate_text(text, max_len=500):
     if text is None:
         return None
@@ -445,6 +464,8 @@ if __name__ == "__main__":
             prompts['response_format'] = MultiHateSpeechLabelingResponse if args.num_sents_per_prompt > 1 else HateSpeechLabelingResponse
         elif args.experiment == 'news-discourse':
             prompts['response_format'] = MultiNewsDiscourseLabelingResponse if args.num_sents_per_prompt > 1 else NewsDiscourseLabelingResponse
+        elif args.experiment == 'bbc-news':
+            prompts['response_format'] = BBCNewsLabelingResponse
     else:
         if args.experiment == 'editorials':
             prompts = make_labeling_prompts_editorials(
@@ -466,6 +487,8 @@ if __name__ == "__main__":
             prompts = make_labeling_prompts_hate_speech(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
         elif args.experiment == 'news-discourse':
             prompts = make_labeling_prompts_news_discourse(input_df=input_df, multi_sentence=args.num_sents_per_prompt > 1, num_sents_per_prompt=args.num_sents_per_prompt)
+        elif args.experiment == 'bbc-news':
+            prompts = make_labeling_prompts_bbc_news(input_df=input_df)
         else:
             raise ValueError(f'Experiment {args.experiment} not supported')
         prompts.to_json(prompt_cache_fname, orient='records', lines=True)
