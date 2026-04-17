@@ -29,6 +29,36 @@ logging.basicConfig(
 )
 
 
+def resolve_hierarchy_results_dir(experiment_dir: Path) -> Path:
+    """
+    Step 6 writes to ``{output_dir}__{variant}`` (e.g. hierarchy_results__standard).
+    Users often ``mkdir -p hierarchy_results`` before step 6, leaving an empty
+    directory that must not shadow the real outputs.
+    """
+    default_dir = experiment_dir / "hierarchy_results"
+    default_thresh = default_dir / "optimal_thresholds.csv"
+    if default_thresh.is_file():
+        return default_dir
+
+    candidates: list[Path] = []
+    for d in sorted(experiment_dir.glob("hierarchy_results__*")):
+        t = d / "optimal_thresholds.csv"
+        if t.is_file():
+            candidates.append(d)
+    if not candidates:
+        raise FileNotFoundError(
+            f"No optimal_thresholds.csv under {default_dir} or "
+            f"{experiment_dir}/hierarchy_results__*"
+        )
+    candidates.sort(
+        key=lambda p: (p / "optimal_thresholds.csv").stat().st_mtime,
+        reverse=True,
+    )
+    chosen = candidates[0]
+    logging.info("Using hierarchy dir: %s", chosen)
+    return chosen
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment_dir", type=str, required=True)
@@ -42,18 +72,7 @@ def main():
     experiment_dir = Path(args.experiment_dir)
     models_dir = experiment_dir / "models"
 
-    # Step 6 appends a variant suffix (e.g. __standard) to the output dir.
-    # Find the actual hierarchy results directory.
-    hierarchy_dir = experiment_dir / "hierarchy_results"
-    if not hierarchy_dir.exists():
-        candidates = sorted(experiment_dir.glob("hierarchy_results__*"))
-        if candidates:
-            hierarchy_dir = candidates[-1]
-            logging.info("Using hierarchy dir: %s", hierarchy_dir)
-        else:
-            raise FileNotFoundError(
-                f"No hierarchy_results directory found in {experiment_dir}"
-            )
+    hierarchy_dir = resolve_hierarchy_results_dir(experiment_dir)
 
     # Load ground truth
     raw_df = pd.read_csv(args.raw_data_csv)
