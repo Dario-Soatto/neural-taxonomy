@@ -194,39 +194,37 @@ def robust_parse_outputs(output):
     if output is None:
         return None
     extracted = extract_list_brackets_from_text(output) or extract_braces_from_text(output) or output
-    try:
-        return _robust_parse_outputs(extracted)
-    except Exception:
-        try:
-            return _robust_parse_outputs(extracted.replace('\n', ' '))
-        except Exception:
-            # Last-ditch regex extraction for label/description.
-            try:
-                label_match = re.search(r'"label"\s*:\s*"([^"]+)"', extracted)
-                desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', extracted)
-                if label_match and desc_match:
-                    return {"label": label_match.group(1), "description": desc_match.group(1)}
-            except Exception:
-                pass
-            # Handle markdown-style output (e.g. **Keyword Label:** value)
-            try:
-                raw = output if output else ""
-                label_match = re.search(
-                    r'\*{0,2}(?:Keyword\s+)?Label[:\s*]*\*{0,2}\s*(.+)',
-                    raw, re.IGNORECASE,
-                )
-                desc_match = re.search(
-                    r'\*{0,2}Description[:\s*]*\*{0,2}\s*(.+)',
-                    raw, re.IGNORECASE,
-                )
-                if label_match and desc_match:
-                    return {
-                        "label": label_match.group(1).strip(),
-                        "description": desc_match.group(1).strip(),
-                    }
-            except Exception:
-                pass
-            return None
+
+    result = _robust_parse_outputs(extracted)
+    if result is not None:
+        return result
+
+    result = _robust_parse_outputs(extracted.replace('\n', ' '))
+    if result is not None:
+        return result
+
+    # Regex extraction for JSON-style label/description.
+    label_match = re.search(r'"label"\s*:\s*"([^"]+)"', extracted)
+    desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', extracted)
+    if label_match and desc_match:
+        return {"label": label_match.group(1), "description": desc_match.group(1)}
+
+    # Handle markdown-style output (e.g. **Keyword Label:** value)
+    label_match = re.search(
+        r'\*{0,2}(?:Keyword\s+)?Label[:\s*]*\*{0,2}\s*(.+)',
+        output, re.IGNORECASE,
+    )
+    desc_match = re.search(
+        r'\*{0,2}Description[:\s*]*\*{0,2}\s*(.+)',
+        output, re.IGNORECASE,
+    )
+    if label_match and desc_match:
+        return {
+            "label": label_match.group(1).strip(),
+            "description": desc_match.group(1).strip(),
+        }
+
+    return None
 
 
 def _robust_parse_outputs(output):
