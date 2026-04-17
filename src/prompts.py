@@ -18,14 +18,31 @@ GENERIC_SIMILARITY_PROMPT = """
 
   Are the two labels in each pair describing similar concepts?
   Think broadly about what each label is describing. Don't pay attention to the specific topic of subject-material of each label.
-  Answer with "Yes" or "No".
-  Return ONLY valid JSON in this exact format (use double quotes everywhere):
+  Answer with "Yes" or "No" for each pair.
+  Return ONLY valid JSON (use double quotes everywhere). Include exactly {k_i} objects in "pairs", with pair_idx 1 through {k_i}:
   {{
     "pairs": [
       {{ "pair_idx": 1, "label": "Yes" }},
       {{ "pair_idx": 2, "label": "No" }}
     ]
   }}
+
+  <example>
+  1. Label 1: "Happy" Label 2: "Joyful"
+  2. Label 1: "Angry" Label 2: "Sad"
+  Answers:
+  {{
+    "pairs": [
+      {{ "pair_idx": 1, "label": "Yes" }},
+      {{ "pair_idx": 2, "label": "No" }}
+    ]
+  }}
+  </example>
+
+  Now it's your turn:
+  {samples_str}
+
+  Answers:
 """
 
 MATHEMATICAL_REASONING_SIMILARITY_PROMPT = """
