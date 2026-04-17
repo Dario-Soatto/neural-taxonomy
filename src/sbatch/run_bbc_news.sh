@@ -13,13 +13,19 @@
 ###############################################################################
 # Full 6-step pipeline for BBC News (2,225 docs, 5 categories).
 #
-# Usage:
-#   sbatch src/sbatch/run_bbc_news.sh
+# Usage (run from repo root so SLURM_SUBMIT_DIR points at this clone):
+#   cd /path/to/neural-taxonomy && sbatch --gres=gpu:a6000:1 src/sbatch/run_bbc_news.sh
 ###############################################################################
 
 set -euo pipefail
 
-REPO_DIR="/nlp/scr/soatto/neural-taxonomy"
+# Use the directory you were in when you ran `sbatch` (avoids running an old clone
+# when you `git pull` in a different path, e.g. juice2 vs nlp/scr).
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  REPO_DIR="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+else
+  REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
 EXPERIMENT_NAME="bbc_news"
 EXPERIMENT_DIR="${REPO_DIR}/experiments/${EXPERIMENT_NAME}"
 MODEL_NAME="meta-llama/Meta-Llama-3.1-8B-Instruct"
@@ -28,6 +34,8 @@ NUM_CENTROIDS=64
 BATCH_SIZE=2500
 
 cd "${REPO_DIR}"
+echo "REPO_DIR=${REPO_DIR}"
+echo "GIT_HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo 'not a git repo')"
 mkdir -p logs "${EXPERIMENT_DIR}/data" "${EXPERIMENT_DIR}/models"
 
 # ── Cache setup (keep caches off /sailhome) ─────────────────────────────────

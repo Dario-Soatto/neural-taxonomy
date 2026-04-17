@@ -633,7 +633,24 @@ def main():
         text_keyword=args.text_keyword_name, 
         k=args.k
     )
-    
+
+    # Fail fast if prompts.py is stale: old GENERIC_SIMILARITY_PROMPT omitted {samples_str},
+    # so the model answered "I'm ready to analyze the pairs..." for every batch.
+    if args.prompt_template == 'generic' and all_prompts:
+        p0 = all_prompts[0]
+        if "Now it's your turn:" not in p0:
+            logging.error(
+                "Generic similarity prompt is missing \"Now it's your turn:\" — "
+                "prompts.py is almost certainly outdated (pull latest main). Aborting."
+            )
+            sys.exit(1)
+        pair_marker = f"1. {args.text_keyword_name} 1:"
+        if pair_marker not in p0:
+            logging.error(
+                "First prompt missing expected pair line %r — aborting.", pair_marker
+            )
+            sys.exit(1)
+
     if args.debug:
         logging.info("Writing debug prompts to file")
         with open('debug_prompts.txt', 'w') as f:
