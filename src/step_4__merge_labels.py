@@ -91,7 +91,7 @@ def assign_kmeans_clusters(embs, save_path=None, kmeans=None):
     if kmeans is None:
         centroids = np.load(save_path)
         n, d = centroids.shape
-        kmeans = faiss.Kmeans(d, n, verbose=True, gpu=True, niter=0, nredo=0)
+        kmeans = faiss.Kmeans(d, n, verbose=True, gpu=torch.cuda.is_available(), niter=0, nredo=0)
         kmeans.train(embs, init_centroids=centroids) # this ensures that kmeans.index is created
         assert np.sum(kmeans.centroids - centroids) == 0, "centroids are not the same" # sanity check
     
