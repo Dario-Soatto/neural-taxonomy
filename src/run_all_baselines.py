@@ -142,12 +142,22 @@ def run_lda_gibbs(texts: list, n_topics: int, random_state: int = 42,
     print(f"    Running LDA (Gibbs sampling, {n_iters} iterations)...")
     mdl = tp.LDAModel(k=n_topics, seed=random_state)
     for text in texts:
-        mdl.add_doc(str(text).split())
+        toks = [w for w in str(text).split() if w]
+        if not toks:
+            toks = ["<empty>"]
+        mdl.add_doc(toks)
     mdl.burn_in = 100
     mdl.train(iterations=n_iters)
 
-    # Get document-topic distributions
-    doc_topic_dist = np.array([mdl.docs[i].get_topic_dist() for i in range(len(mdl.docs))])
+    # Iterate mdl.docs; integer subscripting (mdl.docs[i]) can raise IndexError on
+    # some tomotopy/macOS builds even when len(mdl.docs) matches (see issue reports).
+    docs_list = list(mdl.docs)
+    if len(docs_list) != len(texts):
+        raise RuntimeError(
+            f"tomotopy LDAModel: corpus has {len(docs_list)} docs after train but "
+            f"{len(texts)} were added — aborting Gibbs baseline."
+        )
+    doc_topic_dist = np.array([doc.get_topic_dist() for doc in docs_list])
     clusters = doc_topic_dist.argmax(axis=1)
     return clusters, doc_topic_dist
 
@@ -214,11 +224,20 @@ def run_seeded_lda(texts: list, n_topics: int, random_state: int = 42,
     # Use PLDA (Partially Labeled LDA) as SeededLDA approximation
     mdl = tp.PLDAModel(k=n_topics, seed=random_state)
     for text in texts:
-        mdl.add_doc(str(text).split())
+        toks = [w for w in str(text).split() if w]
+        if not toks:
+            toks = ["<empty>"]
+        mdl.add_doc(toks)
     mdl.burn_in = 100
     mdl.train(iterations=n_iters)
 
-    doc_topic_dist = np.array([mdl.docs[i].get_topic_dist() for i in range(len(mdl.docs))])
+    docs_list = list(mdl.docs)
+    if len(docs_list) != len(texts):
+        raise RuntimeError(
+            f"tomotopy PLDAModel: corpus has {len(docs_list)} docs after train but "
+            f"{len(texts)} were added — aborting seeded-LDA baseline."
+        )
+    doc_topic_dist = np.array([doc.get_topic_dist() for doc in docs_list])
     clusters = doc_topic_dist.argmax(axis=1)
     return clusters, doc_topic_dist
 
