@@ -21,6 +21,14 @@ Usage:
     --n_clusters 10 \
     --text_column sentence_text \
     --output_dir experiments/wiki_biographies_10000/baseline_results
+
+  # BBC (after pipeline + prepare_bbc_baseline_benchmark_csv.py):
+  python src/run_baseline_benchmark.py \
+    --dataset bbc \
+    --experiment_dir experiments/bbc_news \
+    --methods lda_gibbs embedding_kmeans bertopic \
+    --n_clusters 5 \
+    --text_column text
 """
 
 import argparse
@@ -72,6 +80,8 @@ def load_project_data(
 
     For newsgroups: CSV with centroid_id, description, true_label
     For wiki: CSV with custom_id, sentence_text, cluster, label, etc.
+    For bbc: use ``prepare_bbc_baseline_benchmark_csv.py`` to write
+    ``models/all_extracted_discourse_with_clusters_and_text.csv`` (text + true_label).
 
     filter_top_k_categories: if set, filter rows to only the K most common
     true_label values. This is needed for newsgroups where the raw CSV has all
@@ -517,9 +527,9 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["newsgroups", "wiki"],
+        choices=["newsgroups", "wiki", "bbc"],
         required=True,
-        help="Dataset to evaluate.",
+        help="Dataset label (bbc: same CSV layout as newsgroups loader under experiment_dir).",
     )
     parser.add_argument(
         "--experiment_dir",
@@ -538,7 +548,7 @@ def main():
         "--n_clusters",
         type=int,
         required=True,
-        help="Number of clusters (e.g. 8 for newsgroups, 10 for wiki).",
+        help="Number of clusters (e.g. 8 newsgroups, 10 wiki, 5 BBC categories).",
     )
     parser.add_argument(
         "--text_column",
