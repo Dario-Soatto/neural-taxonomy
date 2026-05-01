@@ -46,7 +46,7 @@ from step_4__merge_labels import (  # noqa: E402
     read_dataframe,
     train_kmeans_clustering,
 )
-from utils_openai_client import load_model, robust_load_json  # noqa: E402
+from utils_openai_client import load_model  # noqa: E402
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -78,43 +78,50 @@ def collect_leaf_row_ids(node: dict[str, Any]) -> list[str]:
     return out
 
 
-def extract_json_tree(text: str) -> dict[str, Any] | None:
-    """Parse first top-level JSON object from model output."""
-    text = text.strip()
+def _json_loads_dict(s: str) -> dict[str, Any] | None:
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
     except json.JSONDecodeError:
-        pass
-
-    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if fence:
-        try:
-            obj = robust_load_json(fence.group(1))
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-
-    start = text.find("{")
-    if start < 0:
         return None
-    depth = 0
-    for i in range(start, len(text)):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                chunk = text[start : i + 1]
-                try:
-                    obj = robust_load_json(chunk)
-                    if isinstance(obj, dict):
+
+
+def extract_json_tree(text: str) -> dict[str, Any] | None:
+    """Parse first balanced {...} JSON object from model output (no noisy fallbacks)."""
+    if not text or not text.strip():
+        return None
+
+    candidates: list[str] = []
+    # Fenced ``` blocks (each may contain the tree)
+    for block in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text.strip()):
+        b = block.strip()
+        if b.startswith("{") or "{" in b:
+            candidates.append(b)
+    candidates.append(text.strip())
+
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        start = cand.find("{")
+        if start < 0:
+            continue
+        depth = 0
+        for i in range(start, len(cand)):
+            c = cand[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    chunk = cand[start : i + 1]
+                    obj = _json_loads_dict(chunk)
+                    if obj is not None:
                         return obj
-                except Exception:
-                    return None
+                    break
+        if depth != 0:
+            logging.debug("extract_json_tree: unbalanced braces (truncated JSON?).")
     return None
 
 
@@ -216,13 +223,14 @@ def export_eval_files(
 
 
 DEFAULT_RULES = """\
-- Output MUST be one JSON object only (no markdown fences if possible).
+- Output MUST be exactly one JSON object (valid JSON). No markdown fences. No commentary after the JSON.
+- Use COMPACT JSON: no indentation, minimal whitespace (the tree can get large).
 - Root must use \"id\": \"root\" and include keys \"name\", \"id\", \"children\".
 - Internal grouping nodes use \"name\", \"id\", \"children\".
 - Leaf buckets use \"name\", \"id\", \"leaf_row_ids\": [ ... string ids ... ] (no empty leaf buckets).
 - Every id in BATCH must appear exactly once across all leaf_row_ids in the tree.
 - Every row id that already existed in the tree must still appear exactly once (you may move or regroup).
-- Use stable string ids for internal nodes (e.g. \"n_health\", \"n_econ\").
+- Use short stable ids for internal nodes (e.g. \"n1\", \"n2\").
 """
 
 
@@ -230,22 +238,25 @@ def build_prompt(
     hierarchy: dict[str, Any],
     batch_items: list[dict[str, Any]],
     rules: str,
+    retry_hint: str = "",
 ) -> str:
     batch_lines = []
     for it in batch_items:
-        batch_lines.append(json.dumps(it, ensure_ascii=False))
+        batch_lines.append(json.dumps(it, ensure_ascii=False, separators=(",", ":")))
+    hier_compact = json.dumps(hierarchy, ensure_ascii=False, separators=(",", ":"))
+    hint_block = f"\n{retry_hint}\n" if retry_hint else ""
     return f"""You merge datapoints into a hierarchical taxonomy.
 
 RULES:
 {rules.strip()}
-
-CURRENT HIERARCHY (JSON):
-{json.dumps(hierarchy, indent=2, ensure_ascii=False)}
+{hint_block}
+CURRENT HIERARCHY (JSON, compact):
+{hier_compact}
 
 NEW BATCH (each line is one JSON object with row_id, label, text):
 {chr(10).join(batch_lines)}
 
-Respond with the FULL merged hierarchy as a single JSON object (root id \"root\").
+Respond with the FULL merged hierarchy as ONE compact JSON object only (root id \"root\"). No markdown.
 """
 
 
@@ -289,7 +300,12 @@ def main() -> None:
     parser.add_argument("--model_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--use_openai", action="store_true", help="Use OpenAI API; default is vLLM.")
     parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--max_tokens", type=int, default=8192)
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=16384,
+        help="Max new tokens per LLM completion; raise if JSON is truncated.",
+    )
     parser.add_argument("--max_retries", type=int, default=3)
     parser.add_argument("--rules", type=str, default=None, help="Extra rules appended to the default rule block.")
     parser.add_argument("--kmeans_downsample_to", type=int, default=None)
@@ -408,10 +424,16 @@ def main() -> None:
                 batch_items.append(entry)
 
             expected = prev_ids | new_ids
-            prompt = build_prompt(hierarchy, batch_items, rules)
-
             merged = None
+            last_raw = ""
             for attempt in range(args.max_retries):
+                retry_hint = ""
+                if attempt > 0:
+                    retry_hint = (
+                        "PREVIOUS ATTEMPT FAILED: Output must be valid compact JSON only. "
+                        "Do not truncate; shorten labels if needed."
+                    )
+                prompt = build_prompt(hierarchy, batch_items, rules, retry_hint=retry_hint)
                 if args.use_openai:
                     raw = call_llm_openai(
                         prompt, args.model_name, args.temperature, args.max_tokens
@@ -420,9 +442,12 @@ def main() -> None:
                     raw = call_llm_vllm(
                         prompt, args.model_name, args.temperature, args.max_tokens
                     )
+                last_raw = raw
                 merged = extract_json_tree(raw)
                 if merged is None:
                     logging.warning("Attempt %d: failed to parse JSON.", attempt + 1)
+                    tail = raw[-400:] if raw else ""
+                    logging.warning("Last 400 chars of model output: %r", tail)
                     continue
                 got = set(collect_leaf_row_ids(merged))
                 if got != expected:
@@ -440,10 +465,17 @@ def main() -> None:
                 hierarchy = merged
                 break
 
-            if merged is None or set(collect_leaf_row_ids(hierarchy)) != expected:
+            if merged is None or set(collect_leaf_row_ids(merged)) != expected:
+                fail_path = ckpt_dir / f"failed_raw_step_{step_idx:06d}_cluster_{cid}.txt"
+                try:
+                    fail_path.write_text(last_raw or "", encoding="utf-8")
+                    logging.error("Wrote failing model output to %s", fail_path)
+                except OSError:
+                    pass
                 raise RuntimeError(
                     f"Failed to merge batch for cluster {cid}, step {step_idx}. "
-                    "Try increasing max_retries or max_tokens."
+                    "Increase --max_tokens; ensure VLLM_MAX_MODEL_LEN fits prompt+output "
+                    "(e.g. 32768). See failed_raw_step_* in checkpoints."
                 )
 
             step_idx += 1

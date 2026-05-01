@@ -99,7 +99,8 @@ if [ -z "${HF_TOKEN:-}" ]; then
     done
 fi
 export HOME="$LOCAL_SCRATCH"
-export VLLM_MAX_MODEL_LEN=8192
+# Must fit prompt (full hierarchy grows) + completion. 8192 causes truncated JSON.
+export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 
 source /nlp/scr/soatto/miniconda3/etc/profile.d/conda.sh
 conda activate nlp
@@ -152,7 +153,7 @@ python src/run_llm_iterative_hierarchy.py \
   --k_batch "${K_BATCH}" \
   --seed "${SEED}" \
   --model_name "${MODEL_NAME}" \
-  --max_tokens 8192 \
+  --max_tokens 16384 \
   "${LLM_EXTRA_ARGS[@]}"
 
 echo ">>> Evaluating (same as evaluate_pipeline.py)..."
