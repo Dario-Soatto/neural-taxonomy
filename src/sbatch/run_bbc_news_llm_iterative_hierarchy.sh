@@ -13,6 +13,12 @@
 ###############################################################################
 # BBC News: iterative LLM hierarchy (run_llm_iterative_hierarchy.py) + eval.
 #
+# VRAM: Llama-3.1-8B-Instruct in fp16 needs roughly >=16GB GPU for vLLM. On a
+# ~12GB card vLLM will OOM at load. Options:
+#   - Request a larger GPU, e.g.  sbatch --gres=gpu:a6000:1  src/sbatch/...
+#   - Or use the API:  export USE_OPENAI=1 OPENAI_API_KEY=...  (see below)
+# Optional:  export VLLM_GPU_MEMORY_UTILIZATION=0.80  (helps only on borderline VRAM)
+#
 # Prerequisites (run once): Steps 1–3 of the BBC pipeline must exist under
 #   experiments/bbc_news/
 # i.e. Step 1 labeling JSON shard + triplets + trained SBERT at

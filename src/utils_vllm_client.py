@@ -41,12 +41,14 @@ def load_model(model_name: str):
             logging.info(f"Found {num_gpus} GPUs")
 
             _tokenizer = AutoTokenizer.from_pretrained(model_name)
+            max_len = int(os.environ.get("VLLM_MAX_MODEL_LEN", "10000"))
+            mem_frac = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.90"))
             _model = LLM(
                 model_name,
                 dtype=torch.float16,
                 tensor_parallel_size=num_gpus,  # Use all available GPUs
-                max_model_len=10_000,
-                gpu_memory_utilization=0.90,  # 0.90 is safer than 0.95
+                max_model_len=max_len,
+                gpu_memory_utilization=mem_frac,
                 trust_remote_code=True,
                 enforce_eager=True,  # Enable eager mode for better memory management
             )

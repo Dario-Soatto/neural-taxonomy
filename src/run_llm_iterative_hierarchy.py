@@ -357,6 +357,21 @@ def main() -> None:
     df.to_csv(step4_path, index=False)
     logging.info("Wrote Step-4-style assignments to %s", step4_path)
 
+    # Free GPU before vLLM: SBERT + batch encoding can leave most of VRAM in use.
+    del sbert
+    del embeddings
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
     cluster_ids = sorted(df["cluster"].unique().tolist())
     rng.shuffle(cluster_ids)
 
