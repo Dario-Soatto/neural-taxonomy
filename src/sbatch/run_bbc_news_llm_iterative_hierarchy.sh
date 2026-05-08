@@ -102,7 +102,7 @@ if [ -z "${HF_TOKEN:-}" ]; then
     done
 fi
 export HOME="$LOCAL_SCRATCH"
-# Must fit prompt (full hierarchy grows) + completion. 8192 causes truncated JSON.
+# Must fit prompt (bounded outline + batch items) + completion (patch JSON).
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 
 source /nlp/scr/soatto/miniconda3/etc/profile.d/conda.sh

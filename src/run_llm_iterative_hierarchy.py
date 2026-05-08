@@ -116,18 +116,22 @@ def hierarchy_outline_for_prompt(
 ) -> str:
     """Bounded text outline so prompts stay small as the tree grows."""
     lines: list[str] = []
+    char_count = 0
 
     def walk(n: dict[str, Any], indent: str) -> None:
-        if sum(len(x) + 1 for x in lines) >= max_chars:
+        nonlocal char_count
+        if char_count >= max_chars:
             return
         nid = str(n.get("id", "?"))
         name = str(n.get("name", ""))[:72]
         lids = n.get("leaf_row_ids")
         if lids is not None:
-            lines.append(f"{indent}- {nid} ({name}) [leaf_bucket, {len(lids)} rows]")
+            line = f"{indent}- {nid} ({name}) [leaf_bucket, {len(lids)} rows]"
         else:
             nc = len(n.get("children") or [])
-            lines.append(f"{indent}- {nid} ({name}) [internal, {nc} children]")
+            line = f"{indent}- {nid} ({name}) [internal, {nc} children]"
+        lines.append(line)
+        char_count += len(line) + 1
         for ch in n.get("children") or []:
             walk(ch, indent + "  ")
 
@@ -212,6 +216,47 @@ def apply_patch_to_hierarchy(
         missing = batch_row_ids - seen_place
         extra = seen_place - batch_row_ids
         raise ValueError(f"place_rows must cover batch ids exactly; missing={missing!r} extra={extra!r}")
+
+
+def prefix_patch_ids(
+    patch: dict[str, Any],
+    prefix: str,
+    existing_root: dict[str, Any],
+) -> None:
+    """Prefix newly-created node ids so they can't collide across batches.
+
+    IDs that already exist in ``existing_root`` (e.g. "root") are left as-is
+    so parent_id references to existing nodes still resolve.  Only IDs that
+    are *introduced* in ``create_nodes`` get the prefix, and corresponding
+    references in ``place_rows[*].leaf_bucket_id`` are updated to match.
+    """
+    creates = patch.get("create_nodes") or []
+    new_ids_in_patch: set[str] = set()
+    for spec in creates:
+        if not isinstance(spec, dict):
+            continue
+        cid = str(spec.get("id", ""))
+        if cid and find_node_by_id(existing_root, cid) is None:
+            new_ids_in_patch.add(cid)
+
+    rename: dict[str, str] = {old: prefix + old for old in new_ids_in_patch}
+
+    for spec in creates:
+        if not isinstance(spec, dict):
+            continue
+        cid = str(spec.get("id", ""))
+        if cid in rename:
+            spec["id"] = rename[cid]
+        pid = str(spec.get("parent_id", ""))
+        if pid in rename:
+            spec["parent_id"] = rename[pid]
+
+    for pr in patch.get("place_rows") or []:
+        if not isinstance(pr, dict):
+            continue
+        bid = str(pr.get("leaf_bucket_id", ""))
+        if bid in rename:
+            pr["leaf_bucket_id"] = rename[bid]
 
 
 def extract_json_tree(text: str) -> dict[str, Any] | None:
@@ -616,6 +661,7 @@ def main() -> None:
 
             if args.merge_mode == "patch":
                 batch_row_ids = set(new_ids)
+                id_prefix = f"s{step_idx}_"
                 for attempt in range(args.max_retries):
                     retry_hint = ""
                     if attempt > 0:
@@ -650,6 +696,7 @@ def main() -> None:
                     ):
                         logging.warning("Attempt %d: patch missing create_nodes or place_rows lists.", attempt + 1)
                         continue
+                    prefix_patch_ids(patch, id_prefix, hierarchy)
                     trial = copy.deepcopy(hierarchy)
                     try:
                         apply_patch_to_hierarchy(trial, patch, batch_row_ids)
