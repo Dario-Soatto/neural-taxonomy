@@ -2,7 +2,8 @@
 #SBATCH --job-name=bbc_llm_hier
 #SBATCH --account=nlp
 #SBATCH --partition=jag-standard
-#SBATCH --gres=gpu:1
+# Request a 48GB-class GPU so Llama-3.1-8B loads in vLLM (override if needed, e.g. --gres=gpu:a6000a:1)
+#SBATCH --gres=gpu:a6000:1
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
@@ -15,7 +16,7 @@
 #
 # VRAM: Llama-3.1-8B-Instruct in fp16 needs roughly >=16GB GPU for vLLM. On a
 # ~12GB card vLLM will OOM at load. Options:
-#   - Request a larger GPU, e.g.  sbatch --gres=gpu:a6000:1  src/sbatch/...
+#   - This script requests gpu:a6000:1 by default. Override: sbatch --gres=gpu:a6000a:1 ...
 #   - Or use the API:  export USE_OPENAI=1 OPENAI_API_KEY=...  (see below)
 # Optional:  export VLLM_GPU_MEMORY_UTILIZATION=0.80  (helps only on borderline VRAM)
 #
@@ -33,6 +34,8 @@
 # Usage (from repo root):
 #   mkdir -p logs
 #   sbatch src/sbatch/run_bbc_news_llm_iterative_hierarchy.sh
+# Override GPU type if needed:
+#   sbatch --gres=gpu:a6000a:1 src/sbatch/run_bbc_news_llm_iterative_hierarchy.sh
 #
 # OpenAI instead of vLLM on the node:
 #   export OPENAI_API_KEY="sk-..."
