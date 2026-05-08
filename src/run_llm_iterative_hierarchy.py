@@ -5,6 +5,11 @@ Uses the same SBERT model as Step 4 for embeddings, runs FAISS K-means with a
 large K (default 1024), then processes micro-clusters in random order. Within
 each cluster, rows are shuffled and fed in batches of size min(k, remaining).
 
+``--merge_mode patch`` (default): the prompt sends a **bounded text outline** of
+the existing tree and the LLM returns only ``create_nodes`` + ``place_rows``;
+the script applies patches server-side (scales to large taxonomies).
+``--merge_mode full_tree``: legacy behavior (full merged JSON each step).
+
 Does not modify Step 4–6 scripts. Writes a parallel artifact layout under
 ``--output_dir`` so ``scripts/evaluate_pipeline.py`` can be pointed at the same
 directory as ``--experiment_dir`` (expects ``models/all_extracted_discourse_with_clusters.csv``
@@ -24,6 +29,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -84,6 +90,128 @@ def _json_loads_dict(s: str) -> dict[str, Any] | None:
         return obj if isinstance(obj, dict) else None
     except json.JSONDecodeError:
         return None
+
+
+def find_node_by_id(root: dict[str, Any], node_id: str) -> dict[str, Any] | None:
+    if root.get("id") == node_id:
+        return root
+    for ch in root.get("children") or []:
+        found = find_node_by_id(ch, node_id)
+        if found is not None:
+            return found
+    return None
+
+
+def remove_row_ids_from_tree(node: dict[str, Any], to_remove: set[str]) -> None:
+    lids = node.get("leaf_row_ids")
+    if lids is not None:
+        node["leaf_row_ids"] = [x for x in lids if str(x) not in to_remove]
+    for ch in node.get("children") or []:
+        remove_row_ids_from_tree(ch, to_remove)
+
+
+def hierarchy_outline_for_prompt(
+    node: dict[str, Any],
+    max_chars: int = 14_000,
+) -> str:
+    """Bounded text outline so prompts stay small as the tree grows."""
+    lines: list[str] = []
+
+    def walk(n: dict[str, Any], indent: str) -> None:
+        if sum(len(x) + 1 for x in lines) >= max_chars:
+            return
+        nid = str(n.get("id", "?"))
+        name = str(n.get("name", ""))[:72]
+        lids = n.get("leaf_row_ids")
+        if lids is not None:
+            lines.append(f"{indent}- {nid} ({name}) [leaf_bucket, {len(lids)} rows]")
+        else:
+            nc = len(n.get("children") or [])
+            lines.append(f"{indent}- {nid} ({name}) [internal, {nc} children]")
+        for ch in n.get("children") or []:
+            walk(ch, indent + "  ")
+
+    walk(node, "")
+    out = "\n".join(lines)
+    if len(out) > max_chars:
+        out = out[: max_chars - 40] + "\n... [outline truncated] ..."
+    return out
+
+
+def apply_patch_to_hierarchy(
+    root: dict[str, Any],
+    patch: dict[str, Any],
+    batch_row_ids: set[str],
+) -> None:
+    """
+    Mutates ``root`` in place: create nodes, then move batch_row_ids into buckets.
+    """
+    creates = patch.get("create_nodes") or []
+    places = patch.get("place_rows") or []
+    if not isinstance(creates, list) or not isinstance(places, list):
+        raise ValueError("patch must have create_nodes and place_rows arrays")
+
+    remaining = [c for c in creates if isinstance(c, dict)]
+    max_iters = max(len(remaining) + 5, 12)
+    for _ in range(max_iters):
+        if not remaining:
+            break
+        next_remaining: list[dict[str, Any]] = []
+        added = 0
+        for spec in remaining:
+            cid = str(spec.get("id", ""))
+            pid = str(spec.get("parent_id", ""))
+            if not cid or not pid:
+                next_remaining.append(spec)
+                continue
+            if find_node_by_id(root, cid) is not None:
+                continue
+            parent = find_node_by_id(root, pid)
+            if parent is None:
+                next_remaining.append(spec)
+                continue
+            parent.setdefault("children", [])
+            kind = spec.get("kind", "internal")
+            name = str(spec.get("name", cid))[:200]
+            if kind == "leaf_bucket":
+                child = {"id": cid, "name": name, "leaf_row_ids": []}
+            else:
+                child = {"id": cid, "name": name, "children": []}
+            parent["children"].append(child)
+            added += 1
+        remaining = next_remaining
+        if not remaining:
+            break
+        if added == 0:
+            raise ValueError(f"Unresolved create_nodes (missing parent or cycle?): {remaining[:5]!r}")
+    if remaining:
+        raise ValueError(f"Unresolved create_nodes after iterations: {remaining[:5]!r}")
+
+    remove_row_ids_from_tree(root, batch_row_ids)
+
+    seen_place: set[str] = set()
+    for pr in places:
+        if not isinstance(pr, dict):
+            continue
+        rid = str(pr.get("row_id", ""))
+        bid = str(pr.get("leaf_bucket_id", ""))
+        if not rid or not bid:
+            continue
+        if rid in seen_place:
+            raise ValueError(f"duplicate row_id in place_rows: {rid}")
+        if rid not in batch_row_ids:
+            raise ValueError(f"place_rows row_id {rid} not in current batch")
+        bucket = find_node_by_id(root, bid)
+        if bucket is None:
+            raise ValueError(f"leaf_bucket_id {bid} not found")
+        if bucket.get("leaf_row_ids") is None:
+            bucket["leaf_row_ids"] = []
+        bucket["leaf_row_ids"].append(rid)
+        seen_place.add(rid)
+    if seen_place != batch_row_ids:
+        missing = batch_row_ids - seen_place
+        extra = seen_place - batch_row_ids
+        raise ValueError(f"place_rows must cover batch ids exactly; missing={missing!r} extra={extra!r}")
 
 
 def extract_json_tree(text: str) -> dict[str, Any] | None:
@@ -260,6 +388,46 @@ Respond with the FULL merged hierarchy as ONE compact JSON object only (root id 
 """
 
 
+DEFAULT_PATCH_RULES = """\
+- Output ONE compact JSON object with keys \"create_nodes\" (array) and \"place_rows\" (array). No markdown or prose after the JSON.
+- Root node id is \"root\" (already exists). Reference it as parent_id when attaching under the top level.
+- create_nodes: {\"id\", \"name\", \"parent_id\", \"kind\"} where kind is \"internal\" or \"leaf_bucket\".
+  Create only nodes you need for this batch; use short ids (n1, lb1). Parents must exist or appear earlier in create_nodes (parent before child).
+- place_rows: {\"row_id\", \"leaf_bucket_id\"} — include EVERY row_id from THIS BATCH exactly once. leaf_bucket_id must be a node with kind leaf_bucket (create it if needed).
+- Do NOT output the full tree; only patches for integrating this batch.
+"""
+
+
+def build_prompt_patch(
+    hierarchy_root: dict[str, Any],
+    batch_items: list[dict[str, Any]],
+    rules: str,
+    outline_max_chars: int,
+    retry_hint: str = "",
+) -> str:
+    batch_lines = []
+    for it in batch_items:
+        batch_lines.append(json.dumps(it, ensure_ascii=False, separators=(",", ":")))
+    outline = hierarchy_outline_for_prompt(hierarchy_root, max_chars=outline_max_chars)
+    hint_block = f"\n{retry_hint}\n" if retry_hint else ""
+    batch_ids = [str(it["row_id"]) for it in batch_items]
+    return f"""You integrate new datapoints into an existing taxonomy using a small PATCH (not the full tree).
+
+RULES:
+{rules.strip()}
+{hint_block}
+HIERARCHY OUTLINE (existing structure; row counts only — full tree is not shown):
+{outline}
+
+THIS BATCH row_ids (each must appear exactly once in place_rows): {json.dumps(batch_ids)}
+
+NEW BATCH (one JSON object per line with row_id, label, text):
+{chr(10).join(batch_lines)}
+
+Respond with ONLY the patch JSON object (create_nodes + place_rows).
+"""
+
+
 def call_llm_openai(prompt: str, model_name: str, temperature: float, max_tokens: int) -> str:
     _, client = load_model(model_name)
     response = client.chat.completions.create(
@@ -309,6 +477,19 @@ def main() -> None:
     parser.add_argument("--max_retries", type=int, default=3)
     parser.add_argument("--rules", type=str, default=None, help="Extra rules appended to the default rule block.")
     parser.add_argument("--kmeans_downsample_to", type=int, default=None)
+    parser.add_argument(
+        "--merge_mode",
+        type=str,
+        choices=("patch", "full_tree"),
+        default="patch",
+        help="patch: LLM returns small create_nodes+place_rows (scales). full_tree: legacy full merged JSON.",
+    )
+    parser.add_argument(
+        "--outline_max_chars",
+        type=int,
+        default=14_000,
+        help="Max character budget for hierarchy outline in patch mode.",
+    )
     args = parser.parse_args()
 
     cfg_path = HERE.parent / "config.json"
@@ -324,7 +505,8 @@ def main() -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    rules = DEFAULT_RULES
+    rules_base = DEFAULT_PATCH_RULES if args.merge_mode == "patch" else DEFAULT_RULES
+    rules = rules_base
     if args.rules:
         rules += "\n" + args.rules
 
@@ -334,7 +516,12 @@ def main() -> None:
         df = df.head(args.n_rows_to_process)
 
     df, row_id_col = resolve_row_id_column(df, args.id_col)
-    logging.info("Using row id column: %s (%d rows)", row_id_col, len(df))
+    logging.info(
+        "Using row id column: %s (%d rows), merge_mode=%s",
+        row_id_col,
+        len(df),
+        args.merge_mode,
+    )
 
     rng = random.Random(args.seed)
 
@@ -424,59 +611,128 @@ def main() -> None:
                 batch_items.append(entry)
 
             expected = prev_ids | new_ids
-            merged = None
+            merged: dict[str, Any] | None = None
             last_raw = ""
-            for attempt in range(args.max_retries):
-                retry_hint = ""
-                if attempt > 0:
-                    retry_hint = (
-                        "PREVIOUS ATTEMPT FAILED: Output must be valid compact JSON only. "
-                        "Do not truncate; shorten labels if needed."
-                    )
-                prompt = build_prompt(hierarchy, batch_items, rules, retry_hint=retry_hint)
-                if args.use_openai:
-                    raw = call_llm_openai(
-                        prompt, args.model_name, args.temperature, args.max_tokens
-                    )
-                else:
-                    raw = call_llm_vllm(
-                        prompt, args.model_name, args.temperature, args.max_tokens
-                    )
-                last_raw = raw
-                merged = extract_json_tree(raw)
-                if merged is None:
-                    logging.warning("Attempt %d: failed to parse JSON.", attempt + 1)
-                    tail = raw[-400:] if raw else ""
-                    logging.warning("Last 400 chars of model output: %r", tail)
-                    continue
-                got = set(collect_leaf_row_ids(merged))
-                if got != expected:
-                    logging.warning(
-                        "Attempt %d: leaf id mismatch (got %d, expected %d).",
-                        attempt + 1,
-                        len(got),
-                        len(expected),
-                    )
-                    continue
-                root_id = merged.get("id")
-                if root_id != "root":
-                    logging.warning("Attempt %d: root id was %r, fixing to root.", attempt + 1, root_id)
-                    merged["id"] = "root"
-                hierarchy = merged
-                break
 
-            if merged is None or set(collect_leaf_row_ids(merged)) != expected:
-                fail_path = ckpt_dir / f"failed_raw_step_{step_idx:06d}_cluster_{cid}.txt"
-                try:
-                    fail_path.write_text(last_raw or "", encoding="utf-8")
-                    logging.error("Wrote failing model output to %s", fail_path)
-                except OSError:
-                    pass
-                raise RuntimeError(
-                    f"Failed to merge batch for cluster {cid}, step {step_idx}. "
-                    "Increase --max_tokens; ensure VLLM_MAX_MODEL_LEN fits prompt+output "
-                    "(e.g. 32768). See failed_raw_step_* in checkpoints."
-                )
+            if args.merge_mode == "patch":
+                batch_row_ids = set(new_ids)
+                for attempt in range(args.max_retries):
+                    retry_hint = ""
+                    if attempt > 0:
+                        retry_hint = (
+                            "PREVIOUS ATTEMPT FAILED: Output valid JSON only with keys "
+                            "create_nodes and place_rows. Cover every batch row_id exactly once."
+                        )
+                    prompt = build_prompt_patch(
+                        hierarchy,
+                        batch_items,
+                        rules,
+                        args.outline_max_chars,
+                        retry_hint=retry_hint,
+                    )
+                    if args.use_openai:
+                        raw = call_llm_openai(
+                            prompt, args.model_name, args.temperature, args.max_tokens
+                        )
+                    else:
+                        raw = call_llm_vllm(
+                            prompt, args.model_name, args.temperature, args.max_tokens
+                        )
+                    last_raw = raw
+                    patch = extract_json_tree(raw)
+                    if patch is None:
+                        logging.warning("Attempt %d: failed to parse patch JSON.", attempt + 1)
+                        tail = raw[-400:] if raw else ""
+                        logging.warning("Last 400 chars of model output: %r", tail)
+                        continue
+                    if not isinstance(patch.get("create_nodes"), list) or not isinstance(
+                        patch.get("place_rows"), list
+                    ):
+                        logging.warning("Attempt %d: patch missing create_nodes or place_rows lists.", attempt + 1)
+                        continue
+                    trial = copy.deepcopy(hierarchy)
+                    try:
+                        apply_patch_to_hierarchy(trial, patch, batch_row_ids)
+                    except ValueError as e:
+                        logging.warning("Attempt %d: invalid patch: %s", attempt + 1, e)
+                        continue
+                    got = set(collect_leaf_row_ids(trial))
+                    if got != expected:
+                        logging.warning(
+                            "Attempt %d: leaf id mismatch after patch (got %d, expected %d).",
+                            attempt + 1,
+                            len(got),
+                            len(expected),
+                        )
+                        continue
+                    hierarchy = trial
+                    merged = patch
+                    break
+
+                if merged is None:
+                    fail_path = ckpt_dir / f"failed_raw_step_{step_idx:06d}_cluster_{cid}.txt"
+                    try:
+                        fail_path.write_text(last_raw or "", encoding="utf-8")
+                        logging.error("Wrote failing model output to %s", fail_path)
+                    except OSError:
+                        pass
+                    raise RuntimeError(
+                        f"Failed patch merge for cluster {cid}, step {step_idx}. "
+                        "See failed_raw_step_* and increase --max_retries or check model output."
+                    )
+
+            else:
+                for attempt in range(args.max_retries):
+                    retry_hint = ""
+                    if attempt > 0:
+                        retry_hint = (
+                            "PREVIOUS ATTEMPT FAILED: Output must be valid compact JSON only. "
+                            "Do not truncate; shorten labels if needed."
+                        )
+                    prompt = build_prompt(hierarchy, batch_items, rules, retry_hint=retry_hint)
+                    if args.use_openai:
+                        raw = call_llm_openai(
+                            prompt, args.model_name, args.temperature, args.max_tokens
+                        )
+                    else:
+                        raw = call_llm_vllm(
+                            prompt, args.model_name, args.temperature, args.max_tokens
+                        )
+                    last_raw = raw
+                    merged = extract_json_tree(raw)
+                    if merged is None:
+                        logging.warning("Attempt %d: failed to parse JSON.", attempt + 1)
+                        tail = raw[-400:] if raw else ""
+                        logging.warning("Last 400 chars of model output: %r", tail)
+                        continue
+                    got = set(collect_leaf_row_ids(merged))
+                    if got != expected:
+                        logging.warning(
+                            "Attempt %d: leaf id mismatch (got %d, expected %d).",
+                            attempt + 1,
+                            len(got),
+                            len(expected),
+                        )
+                        continue
+                    root_id = merged.get("id")
+                    if root_id != "root":
+                        logging.warning("Attempt %d: root id was %r, fixing to root.", attempt + 1, root_id)
+                        merged["id"] = "root"
+                    hierarchy = merged
+                    break
+
+                if merged is None or set(collect_leaf_row_ids(hierarchy)) != expected:
+                    fail_path = ckpt_dir / f"failed_raw_step_{step_idx:06d}_cluster_{cid}.txt"
+                    try:
+                        fail_path.write_text(last_raw or "", encoding="utf-8")
+                        logging.error("Wrote failing model output to %s", fail_path)
+                    except OSError:
+                        pass
+                    raise RuntimeError(
+                        f"Failed to merge batch for cluster {cid}, step {step_idx}. "
+                        "Increase --max_tokens; ensure VLLM_MAX_MODEL_LEN fits prompt+output "
+                        "(e.g. 32768). See failed_raw_step_* in checkpoints."
+                    )
 
             step_idx += 1
             ck_path = ckpt_dir / f"step_{step_idx:06d}.json"
@@ -503,6 +759,8 @@ def main() -> None:
         "final_tree": str(final_tree_path),
         "hierarchy_eval_dir": str(hier_dir),
         "step4_csv": str(step4_path),
+        "merge_mode": args.merge_mode,
+        "outline_max_chars": args.outline_max_chars,
     }
     with open(out_dir / "manifest_llm_hierarchy.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)

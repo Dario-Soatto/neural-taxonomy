@@ -143,7 +143,7 @@ if [[ "${USE_OPENAI}" == "1" ]]; then
   LLM_EXTRA_ARGS+=(--use_openai)
 fi
 
-echo ">>> Running iterative LLM hierarchy..."
+echo ">>> Running iterative LLM hierarchy (patch mode; bounded outline + small JSON output)..."
 python src/run_llm_iterative_hierarchy.py \
   --input_data_file "${STEP1_RESULT}" \
   --trained_sbert_model_name "${SBERT_TRAINED}" \
@@ -152,11 +152,13 @@ python src/run_llm_iterative_hierarchy.py \
   --label_col label \
   --text_col description \
   --experiment bbc-news \
+  --merge_mode patch \
+  --outline_max_chars 14000 \
   --ncentroids "${NCENTROIDS}" \
   --k_batch "${K_BATCH}" \
   --seed "${SEED}" \
   --model_name "${MODEL_NAME}" \
-  --max_tokens 16384 \
+  --max_tokens 8192 \
   "${LLM_EXTRA_ARGS[@]}"
 
 echo ">>> Evaluating (same as evaluate_pipeline.py)..."
